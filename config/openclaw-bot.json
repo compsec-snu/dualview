@@ -1,0 +1,112 @@
+{
+  "meta": {
+    "lastTouchedVersion": "2026.3.12",
+    "lastTouchedAt": "2026-03-27T01:36:31.908Z"
+  },
+  "agents": {
+    "defaults": {
+      "model": {
+        "primary": "openai-codex/gpt-5.3-codex-spark"
+      },
+      "compaction": {
+        "mode": "safeguard"
+      },
+      "heartbeat": {
+        "every": "0"
+      }
+    },
+    "list": [
+      {
+        "id": "main",
+        "workspace": "/home/node/workspace"
+      },
+      {
+        "id": "ullm",
+        "workspace": "/home/node/workspace-ullm",
+        "tools": {
+          "allow": [
+            "read"
+          ],
+          "deny": [
+            "exec",
+            "write",
+            "edit",
+            "apply_patch",
+            "process"
+          ]
+        }
+      }
+    ]
+  },
+  "tools": {
+    "profile": "coding",
+    "deny": [
+      "browser",
+      "canvas",
+      "nodes",
+      "process"
+    ],
+    "alsoAllow": [
+      "inspect_symbol"
+    ],
+    "web": {
+      "search": {
+        "provider": "brave"
+      }
+    }
+  },
+  "skills": {
+    "entries": {
+      "gog": {
+        "enabled": false
+      }
+    }
+  },
+  "commands": {
+    "native": "auto",
+    "nativeSkills": "auto",
+    "restart": true,
+    "ownerDisplay": "raw"
+  },
+  "models": {
+    "providers": {}
+  },
+  "session": {
+    "dmScope": "per-channel-peer",
+    "resetTriggers": ["/new", "/reset", "/clear"]
+  },
+  "hooks": {
+    "enabled": true,
+    "token": "dualview-bot-hook-token"
+  },
+  "channels": {
+  },
+  "gateway": {
+    "mode": "local",
+    "auth": { "mode": "token", "token": "dualview-bot" },
+    "controlUi": {
+      "dangerouslyAllowHostHeaderOriginFallback": true,
+      "dangerouslyDisableDeviceAuth": true
+    }
+  },
+  "plugins": {
+    "allowResultModification": true,
+    "load": {
+      "paths": ["/opt/dualview-plugin"]
+    },
+    "entries": {
+      "dualview": {
+        "enabled": true,
+        "config": {
+          "targetChannels": ["webchat:*"],
+          "targetSessionIds": ["agent:main"],
+          "taintMode": "symbolize",
+          "verbose": true,
+          "inspectModel": "openai-codex/gpt-5.3-codex-spark",
+          "fileTrackingEnabled": true,
+          "fileTrackingGitRoot": "/home/node/workspace"
+        }
+      }
+    }
+  }
+}

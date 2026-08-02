@@ -1,0 +1,64 @@
+# Bot container: openclaw gateway + DualView plugin.
+# Build context must contain plugin-dualview/ (copied from plugin/dualview/).
+ARG BASE_IMAGE=openclaw:local
+FROM ${BASE_IMAGE}
+
+USER root
+RUN apt-get update \
+ && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+      ca-certificates curl git sqlite3 python3 python3-pip python-is-python3 poppler-utils \
+ && pip3 install --break-system-packages --no-deps llamafirewall \
+ && pip3 install --break-system-packages openai httpx anyio pydantic typing_extensions sniffio certifi idna distro jiter annotated-types pydantic-core \
+ && pip3 install --break-system-packages --no-deps llamafirewall openai httpx pydantic anyio \
+ && rm -rf /var/lib/apt/lists/*
+RUN npm install -g @anthropic-ai/claude-code @openai/codex
+# gws (Google Workspace CLI): npm postinstall downloads a glibc binary that
+# requires GLIBC_2.39, which Debian 12 (bookworm) doesn't have. Download
+# the musl-static build directly instead.
+ARG GWS_VERSION=0.22.5
+RUN curl -fsSL "https://github.com/googleworkspace/cli/releases/download/v${GWS_VERSION}/google-workspace-cli-x86_64-unknown-linux-musl.tar.gz" \
+      | tar -xz -C /usr/local/bin ./gws \
+ && chmod +x /usr/local/bin/gws
+# fws (fake GWS): local mock server for gws CLI, no real Google credentials needed.
+# tsx is a devDependency but needed at runtime to run fws.ts;
+# base image sets NODE_ENV=production which skips devDeps by default.
+COPY fws/ /opt/fws/
+COPY gws-cache/ /opt/gws-discovery/cache/
+COPY seed-gws-test-data.sh /opt/seed-gws-test-data.sh
+RUN cd /opt/fws && NODE_ENV=development npm install && npm link \
+ && chmod +x /opt/seed-gws-test-data.sh
+
+# Work around ANTHROPIC_MODEL_ALIASES TDZ init-order bug in openclaw-src:
+# extensions with model discovery or auth configPatch that adds
+# agents.defaults.models entries can trigger parseModelRef before the
+# module-level const is initialized (circular import chain).
+# Remove all non-essential extensions — the bot only needs core + DualView plugin.
+RUN rm -rf /app/extensions/ollama /app/extensions/sglang /app/extensions/vllm \
+           /app/extensions/copilot-proxy /app/extensions/qwen-portal-auth \
+           /app/extensions/minimax-portal-auth \
+           /tmp/jiti/ollama-* /tmp/jiti/sglang-* /tmp/jiti/vllm-*
+
+ARG DUALVIEW_PLUGIN_CACHE_BUST=unknown
+RUN echo "dualview-plugin-cache=${DUALVIEW_PLUGIN_CACHE_BUST}" >/tmp/dualview-plugin-cache-bust
+COPY plugin-dualview/ /opt/dualview-plugin/
+RUN cd /opt/dualview-plugin && npm install --omit=dev && npm rebuild better-sqlite3
+
+USER node
+
+# Pre-generate fws config using cached discovery docs (no network needed).
+# Bot runs bind-mount /home/node, so CMD starts fws again to initialize the
+# runtime home directory used by the actual container user.
+ENV GWS_SOURCE_CONFIG_DIR=/opt/gws-discovery
+RUN fws server start && fws server stop \
+ && chmod -R a+rwX /home/node/.local/share/fws
+# gws CLI uses these env vars to route through fws instead of real Google APIs.
+ENV GOOGLE_WORKSPACE_CLI_CONFIG_DIR=/home/node/.local/share/fws/config
+ENV GOOGLE_WORKSPACE_CLI_TOKEN=fake
+ENV HTTPS_PROXY=http://localhost:4101
+ENV SSL_CERT_FILE=/home/node/.local/share/fws/certs/ca-bundle.crt
+ENV NODE_EXTRA_CA_CERTS=/home/node/.local/share/fws/certs/ca-bundle.crt
+ENV GIT_SSL_CAINFO=/home/node/.local/share/fws/certs/ca-bundle.crt
+
+HEALTHCHECK --interval=2s --timeout=3s --start-period=10s \
+  CMD node -e "fetch('http://127.0.0.1:18789/healthz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+CMD ["sh", "-c", "umask 000 && fws server start -p \"${FWS_PORT:-4100}\" && eval $(fws server env) && if [ \"${DUALVIEW_BOT_FWS_SEED:-0}\" = \"1\" ]; then FWS_RESET_BEFORE_SEED=1 bash /opt/seed-gws-test-data.sh --port \"${FWS_PORT:-4100}\"; fi && exec node /app/dist/index.js gateway run --bind lan --port 18789"]

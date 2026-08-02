@@ -1,0 +1,154 @@
+{
+  "id": "dualview",
+  "name": "DualView Plugin",
+  "description": "DualView — pre/post-tool hooks for trust classification and taint tracking. Trusted results remain agent-visible as raw output; untrusted results are symbolized.",
+  "version": "0.3.0",
+  "skills": ["./skills"],
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "auditTrail": {
+        "type": "boolean",
+        "default": true,
+        "description": "Enable audit trail: write a JSONL entry to ~/.openclaw/logs/dualview-audit/<sessionKey>.jsonl for every hook modification. Useful for anomaly detection and session forensics."
+      },
+      "labelMode": {
+        "type": "string",
+        "enum": ["both", "trusted_only", "untrusted_only", "none"],
+        "default": "both",
+        "description": "Which tool result classes to process for agent-visible taint marking. Trusted results are classified/audited but are not text-prefixed. 'untrusted_only' only marks untrusted content. 'none' disables result labeling (pre-tool hook still runs)."
+      },
+      "verbose": {
+        "type": "boolean",
+        "default": false,
+        "description": "Print DualView-[purpose:hook] lines to stdout for every tool call."
+      },
+      "botToken": {
+        "type": "string",
+        "description": "Slack bot token for posting hook notifications (optional, legacy from v0.1)"
+      },
+      "targetChannels": {
+        "type": "array",
+        "items": { "type": "string" },
+        "description": "Channel IDs to enable DualView hooks for (prefixed, e.g. 'discord:1234567890'). Use 'platform:*' wildcard to match all channels for a platform (e.g. 'telegram:*')."
+      },
+      "disabledTargetChannels": {
+        "type": "array",
+        "items": { "type": "string" },
+        "description": "Channel IDs to disable DualView hooks for even when targetChannels includes a broad wildcard such as 'slack:*'. Supports prefixed channel IDs (e.g. 'slack:C0123456789') and platform wildcards (e.g. 'slack:*')."
+      },
+      "targetSessionIds": {
+        "type": "array",
+        "items": { "type": "string" },
+        "description": "Session key fragments to enable DualView hooks for (e.g. phone numbers for CLI agent runs)"
+      },
+      "disabledTargetSessionIds": {
+        "type": "array",
+        "items": { "type": "string" },
+        "description": "Session key fragments to disable DualView hooks for. Disabled entries take precedence over targetSessionIds and targetChannels."
+      },
+      "notifyChannel": {
+        "type": "string",
+        "description": "Where to post DualView-[purpose:hook] notifications. Supports 'slack:ID', 'discord:ID', or 'file:/path/to/file.jsonl'"
+      },
+      "taintMode": {
+        "type": "string",
+        "enum": ["symbolize"],
+        "default": "symbolize",
+        "description": "How to mark untrusted values. Only 'symbolize' is supported (replaces values with opaque symbols); the legacy 'inline' mode was removed in #234."
+      },
+      "toolSchemas": {
+        "type": "object",
+        "description": "DEPRECATED — prefer Data Trust Policy `tools.<name>.inbound` in dualview-policy.yaml (issue #210). User overrides for per-tool output field schemas (merged with built-in schemas). Still read for back-compat."
+      },
+      "toolInputResolve": {
+        "type": "object",
+        "description": "DEPRECATED — prefer Data Trust Policy `tools.<name>.outbound` in dualview-policy.yaml (issue #210). User overrides for per-tool input symbol resolution (merged with built-in TOOL_INPUT_RESOLVE). Set tool name to true (resolve symbols) or false (keep symbols). Still read for back-compat."
+      },
+      "inboundDefault": {
+        "type": "string",
+        "enum": ["TRUSTED", "UNTRUSTED"],
+        "default": "TRUSTED",
+        "description": "Trust classification applied to tool results when no inbound spec matches the tool. 'TRUSTED' (default) passes results through unmodified — fail-open, legacy behavior. 'UNTRUSTED' blanket-symbolizes the entire result — fail-closed, safer for deployments that add new tools without yet declaring their inbound spec."
+      },
+      "execInboundDefault": {
+        "type": "string",
+        "enum": ["TRUSTED", "UNTRUSTED"],
+        "description": "Fallback trust classification for `exec` output when no per-command spec matches. Restricted exec (`env.RESTRICTED=1`) is trusted."
+      },
+      "outboundDefault": {
+        "type": "string",
+        "enum": ["resolve", "not_resolve"],
+        "default": "resolve",
+        "description": "Symbol resolution applied to tool params when no outbound spec matches the tool. 'resolve' (default) replaces symbols with raw values before the tool runs — lets new tools work without an explicit spec, at the cost of letting untrusted values flow into the tool. 'not_resolve' keeps symbols opaque — fail-closed, prevents symbolized values from leaking into tools that may egress them, but an unspec'd tool that cannot interpret symbols will see literal '$_DUALVIEW_SYM_*' strings."
+      },
+      "fileTrackingEnabled": {
+        "type": "boolean",
+        "default": false,
+        "description": "Enable git-based file tracking. After each tool call, file changes are committed with trust tags ([DUALVIEW-TRUSTED]/[DUALVIEW-UNTRUSTED]). Requires the agent workspace to be a git repo."
+      },
+      "fileTrackingGitRoot": {
+        "type": "string",
+        "description": "Git root for file tracking. Defaults to auto-detected git root from cwd (typically .openclaw/workspace/). Required for bot deployments where cwd is not inside a git repo. Supports ~/ tilde expansion."
+      },
+      "fileTrackingStrategy": {
+        "type": "string",
+        "enum": ["fixed", "ondemand"],
+        "default": "ondemand",
+        "description": "How to determine tracked git roots. 'fixed' uses one configured root; 'ondemand' creates canonical DualView roots dynamically."
+      },
+      "inspectModel": {
+        "type": "string",
+        "default": "openai-codex/gpt-5.4",
+        "description": "Model to use for the untrusted LLM in inspect_symbol (for example, 'openai-codex/gpt-5.4' or 'openai/gpt-5.4-mini')."
+      },
+      "inspectTimeoutMs": {
+        "type": "number",
+        "default": 60000,
+        "description": "Maximum time in milliseconds to wait for each inspect_symbol untrusted LLM invocation before returning a timeout error."
+      },
+      "inspectMissingFields": {
+        "type": "string",
+        "enum": ["strict", "skip", "null"],
+        "default": "strict",
+        "description": "How to handle missing outputSchema fields in inspect_symbol responses. 'strict' omits missing fields and returns structured warnings. 'skip' omits missing fields from result. 'null' includes missing fields with null-symbol sentinels."
+      },
+      "scalarTaintMode": {
+        "type": "string",
+        "enum": ["symbolize", "inline"],
+        "default": "symbolize",
+        "description": "How to handle non-string scalar types (int, float, bool) in inspect_symbol output. 'symbolize' (default) re-symbolizes all values. 'inline' returns scalar values as-is (trusted inline metadata)."
+      },
+      "policyPath": {
+        "type": "string",
+        "description": "Path to dualview-policy.yaml for the persistent Data Trust Policy (URL, CHANNEL, DIR category policy and per-tool inbound/outbound overrides)."
+      },
+      "inspectSubagent": {
+        "type": "string",
+        "description": "Subagent id to host the untrusted LLM (`inspect_symbol` tool). Defaults to a built-in subagent."
+      },
+      "fixtureUrlMap": {
+        "type": "object",
+        "description": "URL → fixture mapping for offline web_fetch / web_search testing. Keys are URLs, values describe canned response payloads."
+      },
+      "humanEditPolicy": {
+        "type": "string",
+        "enum": ["auto", "explicit", "ignore"],
+        "default": "auto",
+        "description": "How to handle manual human edits in the human-view worktree. 'auto' (default) detects and reconciles human edits before each tool call. 'explicit' only reconciles when triggered by the user. 'ignore' disables human-edit detection entirely."
+      },
+      "webhookSchemas": {
+        "type": "object",
+        "description": "Per-webhook trust schemas, keyed by jobName. Each value maps field names to 'TRUSTED' or 'UNTRUSTED'. Fields not listed default to UNTRUSTED. Supports three payload formats: (1) template+data: webhook sends { \"template\": \"...\", \"data\": {...} } — template is rendered with per-field symbolized data; (2) flat JSON: webhook sends a plain JSON object — fields are symbolized in-place; (3) non-JSON: entire content is symbolized as a single opaque variable.",
+        "additionalProperties": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string",
+            "enum": ["TRUSTED", "UNTRUSTED"]
+          }
+        }
+      }
+    }
+  }
+}

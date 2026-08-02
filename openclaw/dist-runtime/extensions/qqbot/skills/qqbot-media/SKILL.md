@@ -1,0 +1,1 @@
+../../../../../dist/extensions/qqbot/skills/qqbot-media/SKILL.md

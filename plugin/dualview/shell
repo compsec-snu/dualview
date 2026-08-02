@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+
+if [ -n "$DUALVIEW_SHELL" ]; then
+    exec "$ORIGINAL_SHELL" "$@"
+fi
+
+export DUALVIEW_SHELL=1
+
+exec unshare -nc -- "$ORIGINAL_SHELL" "$@"

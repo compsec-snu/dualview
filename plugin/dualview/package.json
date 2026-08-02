@@ -1,0 +1,16 @@
+{
+  "name": "dualview",
+  "version": "0.3.0",
+  "description": "DualView plugin for OpenClaw",
+  "type": "module",
+  "main": "index.ts",
+  "openclaw": {
+    "extensions": [
+      "./index.ts"
+    ]
+  },
+  "dependencies": {
+    "better-sqlite3": "^12.8.0",
+    "js-yaml": "^4.1.0"
+  }
+}

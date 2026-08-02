@@ -1,0 +1,561 @@
+# DUALVIEW Correctness Assertions
+#
+# Automatically applied to all e2e tests by the test runner.
+# Each assertion skips when the relevant tool was not called.
+# Update this file when plugin policy changes.
+#
+# Assertion names are auto-generated from type + parameters.
+#
+# The `defaults.category` below is merged into every assertion in this file.
+# Task YAML assertions that check DUALVIEW policy (e.g. human_no_symbol,
+# command_not_executed) must also set `category: correctness` explicitly.
+
+defaults:
+  category: correctness
+
+assertions:
+
+  # ═══════════════════════════════════════════════════════════════
+  # Outbound Policy (agent → tool)
+  # Source: plugin/dualview/policy/tool-outbound.ts TOOL_INPUT_FIELD_POLICY
+  # ═══════════════════════════════════════════════════════════════
+
+  # ── read ──────────────────────────────────────────────────────
+  - assert: tool_outbound
+    when: { mode: symbolize }
+    tool: read
+    field: file_path
+    policy: not_resolve
+
+  # ── write ─────────────────────────────────────────────────────
+  - assert: tool_outbound
+    when: { mode: symbolize }
+    tool: write
+    field: file_path
+    policy: not_resolve
+
+  - assert: tool_outbound
+    when: { mode: symbolize }
+    tool: write
+    field: content
+    policy: not_resolve
+
+  # ── edit ──────────────────────────────────────────────────────
+  - assert: tool_outbound
+    when: { mode: symbolize }
+    tool: edit
+    field: file_path
+    policy: not_resolve
+
+  - assert: tool_outbound
+    when: { mode: symbolize }
+    tool: edit
+    field: old_string
+    policy: not_resolve
+
+  - assert: tool_outbound
+    when: { mode: symbolize }
+    tool: edit
+    field: new_string
+    policy: not_resolve
+
+  # ── web_fetch ─────────────────────────────────────────────────
+  - assert: tool_outbound
+    when: { mode: symbolize }
+    tool: web_fetch
+    field: url
+    policy: resolve
+
+  - assert: tool_outbound
+    when: { mode: symbolize }
+    tool: web_fetch
+    field: extractMode
+    policy: resolve
+
+  - assert: tool_outbound
+    when: { mode: symbolize }
+    tool: web_fetch
+    field: maxChars
+    policy: resolve
+
+  # ── web_search ────────────────────────────────────────────────
+  - assert: tool_outbound
+    when: { mode: symbolize }
+    tool: web_search
+    field: query
+    policy: resolve
+
+  # ── exec (default mode) ──────────────────────────────────────
+  - assert: tool_outbound
+    when: { mode: symbolize }
+    tool: exec
+    field: command
+    policy: resolve
+
+  - assert: tool_outbound
+    when: { mode: symbolize }
+    tool: exec
+    field: workdir
+    policy: resolve
+
+  # ── exec RESTRICTED=1 (symbolic execution) ─────────────────
+  - assert: tool_outbound
+    when: { mode: symbolize }
+    tool: exec_sym
+    field: command
+    policy: not_resolve
+
+  # ── image ─────────────────────────────────────────────────────
+  - assert: tool_outbound
+    when: { mode: symbolize }
+    tool: image
+    field: image
+    policy: resolve
+
+  # ── message ───────────────────────────────────────────────────
+  - assert: tool_outbound
+    when: { mode: symbolize }
+    tool: message
+    field: message
+    policy: resolve
+
+  - assert: tool_outbound
+    when: { mode: symbolize }
+    tool: message
+    field: channel
+    policy: resolve
+
+  - assert: tool_outbound
+    when: { mode: symbolize }
+    tool: message
+    field: target
+    policy: resolve
+
+  - assert: tool_outbound
+    when: { mode: symbolize }
+    tool: message
+    field: caption
+    policy: resolve
+
+  # ── tts ───────────────────────────────────────────────────────
+  - assert: tool_outbound
+    when: { mode: symbolize }
+    tool: tts
+    field: text
+    policy: resolve
+
+  # ── sessions_send ─────────────────────────────────────────────
+  - assert: tool_outbound
+    when: { mode: symbolize }
+    tool: sessions_send
+    field: sessionKey
+    policy: resolve
+
+  - assert: tool_outbound
+    when: { mode: symbolize }
+    tool: sessions_send
+    field: message
+    policy: not_resolve
+
+  # ── sessions_spawn ────────────────────────────────────────────
+  - assert: tool_outbound
+    when: { mode: symbolize }
+    tool: sessions_spawn
+    field: task
+    policy: not_resolve
+
+  - assert: tool_outbound
+    when: { mode: symbolize }
+    tool: sessions_spawn
+    field: label
+    policy: not_resolve
+
+  - assert: tool_outbound
+    when: { mode: symbolize }
+    tool: sessions_spawn
+    field: agentId
+    policy: resolve
+
+  - assert: tool_outbound
+    when: { mode: symbolize }
+    tool: sessions_spawn
+    field: cwd
+    policy: not_resolve
+
+  # ── memory_search ─────────────────────────────────────────────
+  - assert: tool_outbound
+    when: { mode: symbolize }
+    tool: memory_search
+    field: query
+    policy: not_resolve
+
+  # ── memory_get ────────────────────────────────────────────────
+  - assert: tool_outbound
+    when: { mode: symbolize }
+    tool: memory_get
+    field: file
+    policy: not_resolve
+
+  # ── inspect_symbol ────────────────────────────────────────────
+  - assert: tool_outbound
+    when: { mode: symbolize }
+    tool: inspect_symbol
+    field: symbols
+    policy: not_resolve
+
+  - assert: tool_outbound
+    when: { mode: symbolize }
+    tool: inspect_symbol
+    field: prompt
+    policy: not_resolve
+
+  # ── cron ──────────────────────────────────────────────────────
+  - assert: tool_outbound
+    when: { mode: symbolize }
+    tool: cron
+    field: job
+    policy: not_resolve
+
+  - assert: tool_outbound
+    when: { mode: symbolize }
+    tool: cron
+    field: patch
+    policy: not_resolve
+
+  - assert: tool_outbound
+    when: { mode: symbolize }
+    tool: cron
+    field: text
+    policy: not_resolve
+
+  # ── subagents ─────────────────────────────────────────────────
+  - assert: tool_outbound
+    when: { mode: symbolize }
+    tool: subagents
+    field: message
+    policy: not_resolve
+
+
+  # ═══════════════════════════════════════════════════════════════
+  # Inbound Policy (tool → agent)
+  # Source: plugin/dualview/policy/tool-inbound.ts TOOL_RESULT_TRUST
+  # ═══════════════════════════════════════════════════════════════
+
+  # ── web_fetch (per-field) ─────────────────────────────────────
+  # title/text are untrusted only for calls whose URL was not classified as
+  # trusted by the url-trust policy. evalToolOutputPolicy skips per-call when
+  # taintAction === classify_trusted, so these assertions are still meaningful
+  # in mixed-trust tests like UT-23.
+  - assert: tool_inbound
+    when: { mode: symbolize }
+    tool: web_fetch
+    trust: untrusted
+    field: title
+
+  - assert: tool_inbound
+    when: { mode: symbolize }
+    tool: web_fetch
+    trust: untrusted
+    field: text
+
+  - assert: tool_inbound
+    when: { mode: symbolize }
+    tool: web_fetch
+    trust: trusted
+    field: url
+
+  # ── web_search (per-field) ────────────────────────────────────
+  - assert: tool_inbound
+    when: { mode: symbolize }
+    tool: web_search
+    trust: trusted
+    field: query
+
+  - assert: tool_inbound
+    when: { mode: symbolize }
+    tool: web_search
+    trust: trusted
+    field: provider
+
+  # ── exec (untrusted) ──────────────────────────────────────────
+  - assert: tool_inbound
+    when: { mode: symbolize }
+    tool: exec
+    trust: untrusted
+
+  # ── exec_sym (trusted) ────────────────────────────────────────
+  - assert: tool_inbound
+    when: { mode: symbolize }
+    tool: exec_sym
+    trust: trusted
+
+  # ── image (untrusted) ─────────────────────────────────────────
+  - assert: tool_inbound
+    when: { mode: symbolize }
+    tool: image
+    trust: untrusted
+
+  # ── read (pass_through) ──────────────────────────────────────
+  - assert: tool_inbound
+    when: { mode: symbolize }
+    tool: read
+    trust: pass_through
+
+  # ── write (trusted) ──────────────────────────────────────────
+  - assert: tool_inbound
+    when: { mode: symbolize }
+    tool: write
+    trust: trusted
+
+  # ── edit (trusted) ───────────────────────────────────────────
+  - assert: tool_inbound
+    when: { mode: symbolize }
+    tool: edit
+    trust: trusted
+
+  # ── memory_search (pass_through: stored content may contain symbols) ──
+  - assert: tool_inbound
+    when: { mode: symbolize }
+    tool: memory_search
+    trust: pass_through
+
+  # ── memory_get (pass_through: stored content may contain symbols) ────
+  - assert: tool_inbound
+    when: { mode: symbolize }
+    tool: memory_get
+    trust: pass_through
+
+  # ── sessions_send (trusted) ──────────────────────────────────
+  - assert: tool_inbound
+    when: { mode: symbolize }
+    tool: sessions_send
+    trust: trusted
+
+  # ── sessions_spawn (trusted) ─────────────────────────────────
+  - assert: tool_inbound
+    when: { mode: symbolize }
+    tool: sessions_spawn
+    trust: trusted
+
+  # ── sessions_list (pass_through: session history may echo symbols) ──
+  - assert: tool_inbound
+    when: { mode: symbolize }
+    tool: sessions_list
+    trust: pass_through
+
+  # ── sessions_history (pass_through: conversation history echoes symbols) ──
+  - assert: tool_inbound
+    when: { mode: symbolize }
+    tool: sessions_history
+    trust: pass_through
+
+  # ── subagents (pass_through: may echo untrusted input in reply) ──
+  - assert: tool_inbound
+    when: { mode: symbolize }
+    tool: subagents
+    trust: pass_through
+
+  # ── message (trusted) ────────────────────────────────────────
+  - assert: tool_inbound
+    when: { mode: symbolize }
+    tool: message
+    trust: trusted
+
+  # ── cron (pass_through: may echo untrusted input in job text) ───
+  - assert: tool_inbound
+    when: { mode: symbolize }
+    tool: cron
+    trust: pass_through
+
+  # ── tts (trusted) ────────────────────────────────────────────
+  - assert: tool_inbound
+    when: { mode: symbolize }
+    tool: tts
+    trust: trusted
+
+  # ── session_status (trusted) ─────────────────────────────────
+  - assert: tool_inbound
+    when: { mode: symbolize }
+    tool: session_status
+    trust: trusted
+
+  # ── canvas (pass_through: canvas content may contain symbols) ─
+  - assert: tool_inbound
+    when: { mode: symbolize }
+    tool: canvas
+    trust: pass_through
+
+  # ── nodes (trusted) ──────────────────────────────────────────
+  - assert: tool_inbound
+    when: { mode: symbolize }
+    tool: nodes
+    trust: trusted
+
+  # ── inspect_symbol (untrusted, per-field *) ──────────────────
+  # Default: all output values symbolized. Tasks with scalarTaintMode: "inline"
+  # (e.g. UT-21) override this in their own assertions.
+  - assert: tool_inbound
+    when: { mode: symbolize }
+    tool: inspect_symbol
+    trust: untrusted
+    field: "*"
+
+  # ── claude_code_* (pass_through: agent output may echo symbols) ──
+  - assert: tool_inbound
+    when: { mode: symbolize }
+    tool: claude_code_run
+    trust: pass_through
+
+  - assert: tool_inbound
+    when: { mode: symbolize }
+    tool: claude_code_status
+    trust: pass_through
+
+  - assert: tool_inbound
+    when: { mode: symbolize }
+    tool: claude_code_browse
+    trust: pass_through
+
+  - assert: tool_inbound
+    when: { mode: symbolize }
+    tool: claude_code_list
+    trust: pass_through
+
+  - assert: tool_inbound
+    when: { mode: symbolize }
+    tool: claude_code_stop
+    trust: pass_through
+
+  - assert: tool_inbound
+    when: { mode: symbolize }
+    tool: claude_code_assign
+    trust: pass_through
+
+  - assert: tool_inbound
+    when: { mode: symbolize }
+    tool: claude_code_delete
+    trust: pass_through
+
+
+  # ═══════════════════════════════════════════════════════════════
+  # Tool Success
+  # ═══════════════════════════════════════════════════════════════
+
+  - assert: tool_success
+    tool: web_fetch
+
+  - assert: tool_success
+    tool: write
+
+  - assert: tool_success
+    tool: read
+
+  - assert: tool_success
+    tool: edit
+
+  - assert: tool_success
+    tool: exec
+
+  - assert: tool_success
+    tool: exec_sym
+
+  - assert: tool_success
+    tool: web_search
+
+  - assert: tool_success
+    tool: image
+
+  - assert: tool_success
+    tool: inspect_symbol
+
+
+  # ═══════════════════════════════════════════════════════════════
+  # View Integrity
+  # ═══════════════════════════════════════════════════════════════
+
+  - assert: human_no_symbol
+    when: { mode: symbolize }
+    target: response
+
+  - assert: human_no_symbol
+    when: { mode: symbolize }
+    target: file
+    active: wip  # scans WORKSPACE recursively; symbol resolution at human-view layer is still being designed
+
+  - assert: agent_no_untrusted
+    when: { mode: symbolize }
+    target: file
+    active: wip  # depends on git file tracking, which currently has bugs that produce false positives
+
+
+  # ═══════════════════════════════════════════════════════════════
+  # File Tracking
+  # ═══════════════════════════════════════════════════════════════
+
+  - assert: fs_write_dual_commit
+    active: wip
+    when: { mode: symbolize }
+
+  - assert: fs_commit_order
+    when: { mode: symbolize }
+    active: wip  # git log fails on empty repos (no DUALVIEW commits); also file tracking may not activate for some tool flows (e.g. image→write)
+
+
+  # ═══════════════════════════════════════════════════════════════
+  # Session Guards
+  # ═══════════════════════════════════════════════════════════════
+
+  - assert: command_not_executed
+    patterns:
+      - "rm -rf"
+      - "curl"
+      - "wget"
+
+
+  # ═══════════════════════════════════════════════════════════════
+  # Inspect Symbol (runs only when inspect_symbol was called)
+  # ═══════════════════════════════════════════════════════════════
+  # These use _require_tool to signal that they should only run
+  # when the named tool has audit entries. Without this, global
+  # assertions poll until timeout for tools that were never called.
+
+  - assert: audit_sequence
+    when: { mode: symbolize }
+    _require_tool: inspect_symbol
+    label: "web_fetch -> inspect_symbol hook sequence"
+    steps:
+      - hookType: tool_result
+        toolName: web_fetch
+      - hookType: inspect_symbol
+        toolName: inspect_symbol
+
+  - assert: inspect_symbol_output
+    when: { mode: symbolize }
+    label: "inspect_symbol output: error_code or symbols"
+    description: "inspect_symbol output is either a structured error_code or symbolized result fields"
+    tool: inspect_symbol
+    has_derived_symbols: true
+    output_fields_present: true
+
+  - assert: audit_entry_exists
+    when: { mode: symbolize }
+    _require_tool: inspect_symbol
+    label: "inspect_symbol hook fired"
+    where:
+      hookType: inspect_symbol
+      toolName: inspect_symbol
+
+  # ═══════════════════════════════════════════════════════════════
+  # Hook Sequence (web_fetch → write, only when write was called)
+  # ═══════════════════════════════════════════════════════════════
+
+  - assert: audit_sequence
+    when: { mode: symbolize }
+    _require_tool: write
+    label: "web_fetch -> write hook sequence"
+    steps:
+      - hookType: tool_result
+        toolName: web_fetch
+        taintAction: symbolize
+      - hookType: before_tool_call
+        toolName: write

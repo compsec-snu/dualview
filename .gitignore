@@ -1,0 +1,22 @@
+# Secrets
+.env
+
+# Node
+node_modules
+node_modules/
+dist/
+
+# Python cache
+__pycache__/
+*.pyc
+
+# DualView runtime state
+tmp-runs/
+.dualview/
+.openclaw/
+logs/
+*.log
+scripts/phase-logs/
+.openclaw-last-build-sha
+.openclaw-last-docker-sha
+.dualview-bot-image-sha

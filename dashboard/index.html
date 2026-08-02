@@ -1,0 +1,74 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>DualView Test Dashboard</title>
+<link rel="stylesheet" href="dashboard.css">
+</head>
+<body>
+<button id="sidebar-reopen" class="sidebar-reopen-btn" onclick="toggleSidebar()" style="display:none">&rsaquo;</button>
+<div class="top-controls">
+  <button id="auto-refresh-btn" class="auto-refresh-btn on" onclick="toggleAutoRefresh()" title="Auto-refresh">&#x21bb;</button>
+  <button class="config-btn" onclick="toggleConfigModal()">Info</button>
+  <select id="theme-select" class="theme-select" onchange="setTheme(this.value)">
+    <option value="theme-github-dark">GitHub Dark</option>
+    <option value="theme-tokyo-night">Tokyo Night</option>
+    <option value="theme-github-light">GitHub Light</option>
+    <option value="theme-dracula">Dracula</option>
+    <option value="theme-solarized-dark">Solarized Dark</option>
+    <option value="theme-solarized-light">Solarized Light</option>
+  </select>
+</div>
+<div class="config-modal-overlay" id="config-modal" onclick="if(event.target===this)toggleConfigModal()">
+  <div class="config-modal">
+    <h2>Server Info</h2>
+    <table id="config-table"><tr><td colspan="2">Loading...</td></tr></table>
+    <button class="close-btn" onclick="toggleConfigModal()">Close</button>
+  </div>
+</div>
+<div id="app">
+  <div id="sidebar">
+    <div id="sidebar-header">
+      <div id="mode-toggle" class="mode-toggle" style="display:none">
+        <button class="mode-btn active" data-mode="e2e" onclick="switchDashboardMode('e2e')">E2E</button>
+        <button class="mode-btn" data-mode="bot" onclick="switchDashboardMode('bot')">Bot</button>
+        <button class="mode-btn" data-mode="eval" onclick="switchDashboardMode('eval')">Eval</button>
+      </div>
+      <div class="dashboard-brand">
+        <img class="dashboard-logo" src="assets/dualview-logo.png" alt="" aria-hidden="true">
+        <h1 id="dashboard-title">DualView Test Dashboard</h1>
+      </div>
+      <div id="ci-banner" style="display:none"></div>
+      <div class="filter-bar" id="e2e-filter-bar">
+        <button class="filter-btn active" data-filter="all">All</button>
+        <button class="filter-btn" data-filter="pass">Pass</button>
+        <button class="filter-btn" data-filter="fail">Fail</button>
+        <button class="filter-btn" data-filter="skip">Skip</button>
+        <button class="filter-btn tool-toggle" id="tool-toggle">Tool</button>
+        <button id="sidebar-toggle" onclick="toggleSidebar()">&lsaquo;</button>
+      </div>
+      <div id="tag-filter-bar" class="tag-filter-bar"></div>
+    </div>
+    <div id="session-list"></div>
+  </div>
+  <div id="resize-handle"></div>
+  <div id="main">
+    <div id="main-header"><div class="welcome">Select a session from the sidebar</div></div>
+    <div id="tab-bar" style="display:none">
+      <button class="tab active" data-tab="conversation">Conversation</button>
+      <button class="tab" data-tab="files-root">Root</button>
+      <button class="tab" data-tab="files-trusted">AgentView</button>
+      <button class="tab" data-tab="files-untrusted">HumanView</button>
+      <button class="tab" data-tab="log">Log</button>
+      <button class="tab" data-tab="audit">Audit</button>
+      <button class="tab" data-tab="symbol-table">Symbol Table</button>
+      <button class="tab" data-tab="test-spec">Test Spec</button>
+    </div>
+    <div id="tab-content"></div>
+  </div>
+</div>
+
+<script type="module" src="js/main.js"></script>
+</body>
+</html>
