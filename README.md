@@ -200,6 +200,16 @@ DualView options are documented in
 npm run typecheck
 ```
 
+## License
+
+The original DualView code in this repository is licensed under the Business
+Source License 1.1 (`BUSL-1.1`). See [`LICENSE`](LICENSE) for the licensed-work
+scope and terms. On August 4, 2030, it will become available under the Apache
+License 2.0.
+
+The bundled OpenClaw source, third-party dependencies, and files with separate
+license notices remain under their respective licenses.
+
 ## Acknowledgements
 
 Contributors:

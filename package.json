@@ -2,6 +2,7 @@
   "name": "dualview",
   "version": "0.3.0",
   "private": true,
+  "license": "BUSL-1.1",
   "type": "module",
   "scripts": {
     "openclaw": "node ./openclaw/openclaw.mjs",

@@ -2,6 +2,7 @@
   "name": "dualview",
   "version": "0.3.0",
   "description": "DualView plugin for OpenClaw",
+  "license": "BUSL-1.1",
   "type": "module",
   "main": "index.ts",
   "openclaw": {
