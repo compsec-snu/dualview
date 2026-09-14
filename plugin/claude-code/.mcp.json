@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "dualview": {
+      "command": "${CLAUDE_PLUGIN_ROOT}/bin/dualview-mcp",
+      "env": {
+        "DUALVIEW_WORKSPACE": "${CLAUDE_PROJECT_DIR}"
+      }
+    }
+  }
+}

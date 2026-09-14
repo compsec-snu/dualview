@@ -7,14 +7,15 @@
  *   2. Sends them to an untrusted LLM in an isolated context (no tools)
  *   3. Re-symbolizes the output before returning to the trusted LLM
  *
- * The untrusted LLM is invoked via a named OpenClaw subagent by default, or
- * through a local CLI subprocess when configured with `inspectSubagent: "cli"`.
+ * The untrusted LLM is invoked via a named OpenClaw subagent by default, through
+ * OpenRouter directly for OpenRouter models, or through a local CLI subprocess
+ * when configured with `inspectSubagent: "cli"`.
  *
  * The untrusted LLM never sees tool handles or the trusted context. The trusted
  * LLM never sees raw untrusted data — only derived symbols.
  */
 
-import { execFileSync } from "child_process";
+import { execFile, execFileSync } from "child_process";
 import { randomUUID } from "crypto";
 import { mkdtempSync, rmSync, writeFileSync } from "fs";
 import { tmpdir } from "os";
@@ -28,9 +29,26 @@ import {
   type SymbolMap,
 } from "./dualview-symbol-table.js";
 import { getActiveFormat } from "./dualview-symbol-format.js";
-import type { OpenClawPluginApi, AnyAgentTool } from "openclaw/plugin-sdk/core";
 
-type PluginLogger = OpenClawPluginApi["logger"];
+interface PluginLogger {
+  info(message: string): void;
+  warn(message: string): void;
+  error(message: string): void;
+}
+
+interface OpenClawPluginApi {
+  runtime?: {
+    subagent?: {
+      run(input: Record<string, unknown>): Promise<{ runId: string }>;
+      waitForRun(input: Record<string, unknown>): Promise<{
+        status: string;
+        error?: string;
+      }>;
+      getSessionMessages(input: Record<string, unknown>): Promise<{ messages: unknown[] }>;
+      deleteSession(input: Record<string, unknown>): Promise<unknown>;
+    };
+  };
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Types
@@ -105,7 +123,10 @@ export interface InspectSymbolOpts {
    * Override for the untrusted LLM invocation (testing only).
    * May return a bare response string or an InspectLLMResult with usage.
    */
-  _invokeLLM?: (prompt: string, model: string) => string | InspectLLMResult;
+  _invokeLLM?: (
+    prompt: string,
+    model: string,
+  ) => string | InspectLLMResult | Promise<string | InspectLLMResult>;
   dbPath?: string;
 }
 
@@ -299,7 +320,44 @@ export function parseCodexCliJsonl(stdout: string): InspectLLMResult {
  * - OpenAI/Codex models (openai/*, openai-codex/*, gpt-*, o*): `codex exec -m <model> --json`
  * - Anthropic/other models: `claude -p --model <model> --output-format json`
  */
-function invokeCLI(model: string, prompt: string, timeoutMs: number): InspectLLMResult {
+export function normalizeClaudeCliModel(model: string): string {
+  return model
+    .replace(/^(?:anthropic|github-copilot)\//, "")
+    .replace(/(\d)\.(\d)/g, "$1-$2");
+}
+
+function execFileAsync(
+  file: string,
+  args: string[],
+  input: string | null,
+  timeoutMs: number,
+): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const child = execFile(
+      file,
+      args,
+      {
+        encoding: "utf-8",
+        timeout: timeoutMs,
+        maxBuffer: 1024 * 1024,
+      },
+      (error, stdout) => {
+        if (error) {
+          reject(error);
+          return;
+        }
+        resolve(stdout);
+      },
+    );
+    if (input !== null) child.stdin?.end(input);
+  });
+}
+
+async function invokeCLI(
+  model: string,
+  prompt: string,
+  timeoutMs: number,
+): Promise<InspectLLMResult> {
   const fullPrompt = `${INSPECT_SYMBOL_PROMPT}\n${prompt}`;
   const isOpenAI = model.startsWith("openai/")
     || model.startsWith("openai-codex/")
@@ -308,28 +366,89 @@ function invokeCLI(model: string, prompt: string, timeoutMs: number): InspectLLM
   if (isOpenAI) {
     // Strip provider prefix for codex (e.g. "openai-codex/gpt-5.4" -> "gpt-5.4")
     const codexModel = model.replace(/^openai(?:-codex)?\//, "");
-    const raw = execFileSync("codex", ["exec", "-m", codexModel, "--json", fullPrompt], {
-      encoding: "utf-8",
-      timeout: timeoutMs,
-      maxBuffer: 1024 * 1024,
-      stdio: ["pipe", "pipe", "pipe"],
-    });
+    const raw = await execFileAsync(
+      "codex",
+      ["exec", "-m", codexModel, "--json", fullPrompt],
+      null,
+      timeoutMs,
+    );
     const parsed = parseCodexCliJsonl(raw);
     return { text: parsed.text.trim(), usage: parsed.usage };
   }
-  const raw = execFileSync(
+  const raw = await execFileAsync(
     "claude",
-    ["-p", "--model", model, "--output-format", "json"],
-    {
-      input: fullPrompt,
-      encoding: "utf-8",
-      timeout: timeoutMs,
-      maxBuffer: 1024 * 1024,
-      stdio: ["pipe", "pipe", "pipe"],
-    },
+    ["-p", "--model", normalizeClaudeCliModel(model), "--output-format", "json"],
+    fullPrompt,
+    timeoutMs,
   );
   const parsed = parseClaudeCliJson(raw);
   return { text: parsed.text.trim(), usage: parsed.usage };
+}
+
+export async function invokeOpenRouter(
+  model: string,
+  prompt: string,
+  timeoutMs: number,
+  apiKey = process.env.OPENROUTER_API_KEY,
+  fetchImpl: typeof fetch = fetch,
+): Promise<InspectLLMResult> {
+  const key = apiKey?.trim();
+  if (!key) {
+    throw new Error("OPENROUTER_API_KEY is required for OpenRouter inspect_symbol models");
+  }
+
+  const modelId = model.replace(/^openrouter\//, "");
+  const response = await fetchImpl("https://openrouter.ai/api/v1/chat/completions", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${key}`,
+      "Content-Type": "application/json",
+      "HTTP-Referer": "https://openclaw.ai",
+      "X-Title": "OpenClaw",
+    },
+    body: JSON.stringify({
+      model: modelId,
+      messages: [
+        { role: "system", content: INSPECT_SYMBOL_PROMPT },
+        { role: "user", content: prompt },
+      ],
+      reasoning: { effort: "none" },
+      max_tokens: 2048,
+    }),
+    signal: AbortSignal.timeout(timeoutMs),
+  });
+
+  if (!response.ok) {
+    const detail = (await response.text()).slice(0, 500);
+    throw new Error(`OpenRouter inspect_symbol request failed (${response.status}): ${detail}`);
+  }
+
+  const payload = await response.json() as {
+    choices?: Array<{ message?: { content?: string } }>;
+    usage?: {
+      prompt_tokens?: number;
+      completion_tokens?: number;
+      total_tokens?: number;
+      cost?: number;
+    };
+  };
+  const text = payload.choices?.[0]?.message?.content?.trim();
+  if (!text) {
+    throw new Error("OpenRouter inspect_symbol response did not contain assistant text");
+  }
+
+  const reportedUsage = payload.usage;
+  const usage = reportedUsage
+    ? {
+        ...emptyUsage(),
+        input_tokens: reportedUsage.prompt_tokens ?? 0,
+        output_tokens: reportedUsage.completion_tokens ?? 0,
+        total_tokens: reportedUsage.total_tokens ?? 0,
+        cost_usd: reportedUsage.cost ?? 0,
+        request_count: 1,
+      }
+    : null;
+  return { text, usage };
 }
 
 /**
@@ -377,9 +496,13 @@ async function invokeUntrustedLLM({ api, subagent, model, prompt, dataEntries, t
   dataEntries: InspectDataEntry[];
   timeoutMs: number;
 }): Promise<InspectLLMResult> {
+  if (model.startsWith("openrouter/")) {
+    return invokeOpenRouter(model, prompt, timeoutMs);
+  }
+
+  const subagentRuntime = api.runtime?.subagent;
   const useCliMode = subagent === "cli"
-    || !api.runtime?.subagent?.run
-    || api.runtime.subagent.run.constructor?.name !== "AsyncFunction";
+    || typeof subagentRuntime?.run !== "function";
 
   if (useCliMode) {
     return invokeCLI(model, prompt, timeoutMs);
@@ -389,7 +512,7 @@ async function invokeUntrustedLLM({ api, subagent, model, prompt, dataEntries, t
   const cleanupDataContext = setInspectDataContext(sessionKey, dataEntries);
 
   try {
-    const run = await api.runtime.subagent.run({
+    const run = await subagentRuntime.run({
       sessionKey,
       message: prompt,
       extraSystemPrompt: INSPECT_SYMBOL_PROMPT,
@@ -399,7 +522,7 @@ async function invokeUntrustedLLM({ api, subagent, model, prompt, dataEntries, t
       idempotencyKey: randomUUID(),
     });
 
-    const waitResult = await api.runtime.subagent.waitForRun({
+    const waitResult = await subagentRuntime.waitForRun({
       runId: run.runId,
       timeoutMs,
     });
@@ -410,7 +533,7 @@ async function invokeUntrustedLLM({ api, subagent, model, prompt, dataEntries, t
       throw new Error(waitResult.error?.trim() || "Subagent failed");
     }
 
-    const sessionMessages = await api.runtime.subagent.getSessionMessages({
+    const sessionMessages = await subagentRuntime.getSessionMessages({
       sessionKey,
       // TODO: choose appropriate value
       limit: 200,
@@ -421,7 +544,7 @@ async function invokeUntrustedLLM({ api, subagent, model, prompt, dataEntries, t
     // so the call fails in that context.  Since we already have the response,
     // swallow the error to avoid breaking inspect_symbol in spawned agents (#161).
     try {
-      await api.runtime.subagent.deleteSession({
+      await subagentRuntime.deleteSession({
         sessionKey,
         deleteTranscript: false,
       });
@@ -482,8 +605,9 @@ export function createInspectSymbolTool(opts: InspectSymbolOpts) {
     description:
       "Extract, summarize, or transform symbolized untrusted data ($_DUALVIEW_SYM_* symbols). " +
       "Use this tool whenever you need to understand or work with the content behind a symbol. " +
-      "You MUST provide a 'prompt' describing what you need — e.g., 'summarize this content', " +
-      "'extract the title and author', 'list all URLs mentioned'. " +
+      "You MUST provide 'symbols', 'outputSchema', and 'prompt'. Define each requested field in " +
+      "'outputSchema' — e.g., { \"summary\": \"string\" } — and describe the transformation in " +
+      "'prompt' — e.g., 'summarize this content', 'extract the title and author'. " +
       "String fields are returned as new symbols. " +
       "Non-string fields (int, float, bool) are returned as literal values you can use directly.",
     parameters: {
@@ -549,9 +673,16 @@ export function createInspectSymbolTool(opts: InspectSymbolOpts) {
       // 4. Invoke untrusted LLM
       let rawResponse: string;
       let ullmUsage: InspectUsage | null = null;
+      const inspectTransport = _invokeLLM != null
+        ? "mock"
+        : effectiveModel.startsWith("openrouter/")
+          ? "openrouter"
+          : subagent === "cli" || !api?.runtime?.subagent?.run
+            ? "cli"
+            : "subagent";
       try {
         if (_invokeLLM != null) {
-          const mocked = _invokeLLM(llmPrompt, effectiveModel);
+          const mocked = await _invokeLLM(llmPrompt, effectiveModel);
           if (typeof mocked === "string") {
             rawResponse = mocked;
           } else {
@@ -701,6 +832,7 @@ export function createInspectSymbolTool(opts: InspectSymbolOpts) {
               ullmPrompt: llmPrompt,
               ullmResponse: rawResponse,
               model: effectiveModel,
+              transport: inspectTransport,
               usage: ullmUsage,
               symbolsCreated: Object.entries(symbolized)
                 .filter(([, v]) => typeof v === "string" && v.startsWith(getActiveFormat().prefix))
@@ -728,7 +860,7 @@ export function createInspectSymbolTool(opts: InspectSymbolOpts) {
         content: [{ type: "text", text: JSON.stringify(responsePayload, null, 2) }],
       };
     },
-  } as AnyAgentTool;
+  };
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1311,7 +1443,7 @@ const DataRefSchema = {
   anyOf: [{ type: "number" }, { type: "string" }],
 };
 
-export function createPdfToTextToolForInspect(ctx: { sessionKey?: string }): AnyAgentTool {
+export function createPdfToTextToolForInspect(ctx: { sessionKey?: string }) {
   return {
     label: "PDF to Text",
     name: "pdf_to_text",
@@ -1327,14 +1459,14 @@ export function createPdfToTextToolForInspect(ctx: { sessionKey?: string }): Any
       required: ["data"],
       additionalProperties: false,
     },
-    execute: async (_toolCallId, args) =>
+    execute: async (_toolCallId: string, args: Record<string, unknown>) =>
       toolJsonResult(
         runDocumentToolForSession(ctx.sessionKey, "pdf_to_text", args as Record<string, unknown>),
       ),
   };
 }
 
-export function createCsvQueryToolForInspect(ctx: { sessionKey?: string }): AnyAgentTool {
+export function createCsvQueryToolForInspect(ctx: { sessionKey?: string }) {
   return {
     label: "CSV Query",
     name: "csv_query",
@@ -1364,7 +1496,7 @@ export function createCsvQueryToolForInspect(ctx: { sessionKey?: string }): AnyA
       required: ["data"],
       additionalProperties: false,
     },
-    execute: async (_toolCallId, args) =>
+    execute: async (_toolCallId: string, args: Record<string, unknown>) =>
       toolJsonResult(
         runDocumentToolForSession(ctx.sessionKey, "csv_query", args as Record<string, unknown>),
       ),

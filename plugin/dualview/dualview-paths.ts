@@ -1,6 +1,6 @@
 import { existsSync, realpathSync } from "fs";
 import { homedir } from "os";
-import { join, resolve } from "path";
+import { basename, dirname, join, resolve } from "path";
 
 export const DUALVIEW_SCHEMA_VERSION = 1;
 
@@ -13,8 +13,18 @@ export interface DualViewWorkspaceMetadata {
 /** Return the canonical absolute workspace path used for DualView identity. */
 export function canonicalWorkspacePath(workspacePath: string): string {
   const resolved = resolve(workspacePath);
+  let existingAncestor = resolved;
+  const missingParts: string[] = [];
+
+  while (!existsSync(existingAncestor)) {
+    const parent = dirname(existingAncestor);
+    if (parent === existingAncestor) return resolved;
+    missingParts.unshift(basename(existingAncestor));
+    existingAncestor = parent;
+  }
+
   try {
-    return realpathSync(resolved);
+    return resolve(realpathSync(existingAncestor), ...missingParts);
   } catch {
     return resolved;
   }

@@ -13,9 +13,12 @@
 #   Succeeds when any accepted LLM credential source is present. Mirrors the
 #   auth sources tried by scripts/run-bot.sh.
 require_llm_credential() {
+  local mode="${1:-standard}"
   if [ -n "${ANTHROPIC_API_KEY:-}" ] \
     || [ -n "${OPENAI_API_KEY:-}" ] \
     || [ -n "${GEMINI_API_KEY:-}" ] \
+    || [ -n "${OPENROUTER_API_KEY:-}" ] \
+    || { [ "$mode" = "foundry" ] && [ -n "${FOUNDRY_ENDPOINT:-}" ] && [ -n "${FOUNDRY_KEY:-}" ]; } \
     || { [ -n "${OPENAI_CODEX_ACCESS:-}" ] && [ -n "${OPENAI_CODEX_REFRESH:-}" ]; } \
     || [ -f "${HOME}/.codex/auth.json" ] \
     || [ -f "${HOME}/.openclaw/agents/main/agent/auth-profiles.json" ]; then
@@ -27,6 +30,12 @@ ERROR: No LLM credential found in .env or environment.
     ANTHROPIC_API_KEY=sk-ant-...
     OPENAI_API_KEY=sk-...
     GEMINI_API_KEY=...
+    OPENROUTER_API_KEY=...
+MSG
+  if [ "$mode" = "foundry" ]; then
+    echo "    FOUNDRY_ENDPOINT=...  and  FOUNDRY_KEY=..." >&2
+  fi
+  cat >&2 <<'MSG'
     OPENAI_CODEX_ACCESS=...  and  OPENAI_CODEX_REFRESH=...
   Or provide ~/.codex/auth.json, or an existing ~/.openclaw auth profile.
 MSG

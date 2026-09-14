@@ -1,7 +1,25 @@
 import { execFile, execFileSync } from "child_process";
-import { mkdirSync, rmSync, rmdirSync, statSync, existsSync, writeFileSync, readFileSync, appendFileSync } from "fs";
+import {
+  appendFileSync,
+  chmodSync,
+  closeSync,
+  copyFileSync,
+  existsSync,
+  lstatSync,
+  mkdtempSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  readlinkSync,
+  renameSync,
+  rmSync,
+  rmdirSync,
+  statSync,
+  symlinkSync,
+  writeFileSync,
+} from "fs";
 import os from "os";
-import { join, relative } from "path";
+import { dirname, isAbsolute, join, relative, resolve } from "path";
 import {
   dualviewAgentViewPathFor,
   dualviewWorkspaceDirFor,
@@ -45,11 +63,95 @@ export interface GitExecResult {
 export interface GitExecSyncResult {
   stdout: string;
   stderr: string;
+  code: number;
 }
 
 export interface GitExecOpts {
   cwd: string;
   env?: Record<string, string>;
+}
+
+export interface GitFileSnapshot {
+  path: string;
+  content: Buffer | null;
+  mode?: "100644" | "100755" | "120000";
+}
+
+export interface GitIndexEntrySnapshot {
+  path: string;
+  entries: Buffer;
+  flags: string[];
+}
+
+const GIT_SNAPSHOT_MAX_BUFFER = 1024 * 1024 * 1024;
+
+function isMissingPathError(err: unknown): boolean {
+  return (err as NodeJS.ErrnoException).code === "ENOENT";
+}
+
+export function readFilesystemSnapshot(
+  targetPath: string,
+  filePath: string,
+): GitFileSnapshot {
+  let stat: ReturnType<typeof lstatSync>;
+  try {
+    stat = lstatSync(targetPath);
+  } catch (err) {
+    if (isMissingPathError(err)) return { path: filePath, content: null };
+    throw err;
+  }
+
+  if (stat.isDirectory()) {
+    throw new Error(`cannot snapshot directory: ${targetPath}`);
+  }
+  if (stat.isSymbolicLink()) {
+    return {
+      path: filePath,
+      content: Buffer.from(readlinkSync(targetPath)),
+      mode: "120000",
+    };
+  }
+  return {
+    path: filePath,
+    content: readFileSync(targetPath),
+    mode: stat.mode & 0o111 ? "100755" : "100644",
+  };
+}
+
+export function readWorktreeSnapshot(
+  rootPath: string,
+  filePath: string,
+): GitFileSnapshot {
+  return readFilesystemSnapshot(join(rootPath, filePath), filePath);
+}
+
+export function writeFilesystemSnapshot(
+  targetPath: string,
+  snapshot: GitFileSnapshot,
+): void {
+  rmSync(targetPath, { recursive: true, force: true });
+  if (snapshot.content === null) return;
+
+  const parentDir = dirname(targetPath);
+  if (!existsSync(parentDir)) mkdirSync(parentDir, { recursive: true });
+  if (snapshot.mode === "120000") {
+    symlinkSync(snapshot.content.toString(), targetPath);
+    return;
+  }
+
+  const mode = snapshot.mode === "100755" ? 0o755 : 0o644;
+  writeFileSync(targetPath, snapshot.content, { mode });
+  chmodSync(targetPath, mode);
+}
+
+export function fileSnapshotsEqual(
+  left: GitFileSnapshot,
+  right: GitFileSnapshot,
+): boolean {
+  if (left.content === null || right.content === null) {
+    return left.content === right.content;
+  }
+  return left.mode === right.mode && left.content.equals(right.content);
 }
 
 /**
@@ -74,11 +176,240 @@ export function gitExecSync(args: string[], { cwd, env }: GitExecOpts = { cwd: "
       env: { ...process.env, ...env },
       maxBuffer: 10 * 1024 * 1024,
       encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe"],
     });
-    return { stdout: stdout ?? "", stderr: "" };
+    return { stdout: stdout ?? "", stderr: "", code: 0 };
   } catch (err: unknown) {
-    const e = err as { stdout?: string; stderr?: string };
-    return { stdout: e.stdout ?? "", stderr: e.stderr ?? "" };
+    const e = err as {
+      stdout?: string | Buffer;
+      stderr?: string | Buffer;
+      status?: number | null;
+    };
+    return {
+      stdout: Buffer.isBuffer(e.stdout) ? e.stdout.toString() : e.stdout ?? "",
+      stderr: Buffer.isBuffer(e.stderr) ? e.stderr.toString() : e.stderr ?? "",
+      code: typeof e.status === "number" ? e.status : 1,
+    };
+  }
+}
+
+export function gitExecSyncOrThrow(
+  args: string[],
+  opts: GitExecOpts,
+  action = `git ${args[0] ?? "command"}`,
+): GitExecSyncResult {
+  const result = gitExecSync(args, opts);
+  if (result.code !== 0) {
+    const detail = result.stderr.trim() || result.stdout.trim() || `exit code ${result.code}`;
+    throw new Error(`${action} failed: ${detail}`);
+  }
+  return result;
+}
+
+export function withTemporaryGitIndex<T>(
+  opts: GitExecOpts,
+  treeish: string,
+  action: (temporaryOpts: GitExecOpts) => T,
+): T {
+  const tempDir = mkdtempSync(join(os.tmpdir(), "dualview-index-"));
+  const temporaryOpts: GitExecOpts = {
+    cwd: opts.cwd,
+    env: {
+      ...opts.env,
+      GIT_INDEX_FILE: join(tempDir, "index"),
+    },
+  };
+  try {
+    gitExecSyncOrThrow(
+      ["read-tree", treeish],
+      temporaryOpts,
+      "initializing temporary Git index",
+    );
+    return action(temporaryOpts);
+  } finally {
+    rmSync(tempDir, { recursive: true, force: true });
+  }
+}
+
+export function withLockedGitIndex<T>(
+  opts: GitExecOpts,
+  action: (lockedIndexOpts: GitExecOpts) => T,
+): T {
+  const rawIndexPath = gitExecSyncOrThrow(
+    ["rev-parse", "--git-path", "index"],
+    opts,
+    "locating Git index",
+  ).stdout.trim();
+  const indexPath = isAbsolute(rawIndexPath)
+    ? rawIndexPath
+    : resolve(opts.cwd, rawIndexPath);
+  const lockPath = `${indexPath}.lock`;
+  const tempDir = mkdtempSync(join(os.tmpdir(), "dualview-locked-index-"));
+  const tempIndexPath = join(tempDir, "index");
+  let lockHeld = false;
+
+  try {
+    const lockFd = openSync(lockPath, "wx");
+    closeSync(lockFd);
+    lockHeld = true;
+    if (existsSync(indexPath)) {
+      copyFileSync(indexPath, tempIndexPath);
+    } else {
+      gitExecSyncOrThrow(
+        ["read-tree", "HEAD"],
+        {
+          cwd: opts.cwd,
+          env: { ...opts.env, GIT_INDEX_FILE: tempIndexPath },
+        },
+        "initializing locked Git index",
+      );
+    }
+
+    const lockedIndexOpts: GitExecOpts = {
+      cwd: opts.cwd,
+      env: {
+        ...opts.env,
+        GIT_INDEX_FILE: tempIndexPath,
+      },
+    };
+    const result = action(lockedIndexOpts);
+    copyFileSync(tempIndexPath, lockPath);
+    renameSync(lockPath, indexPath);
+    lockHeld = false;
+    return result;
+  } finally {
+    if (lockHeld) rmSync(lockPath, { force: true });
+    rmSync(tempDir, { recursive: true, force: true });
+  }
+}
+
+export function readGitIndexSnapshot(
+  filePath: string,
+  { cwd, env }: GitExecOpts,
+): GitFileSnapshot {
+  const childEnv = { ...process.env, ...env };
+  const modeOutput = execFileSync("git", ["ls-files", "-s", "--", filePath], {
+    cwd,
+    env: childEnv,
+    maxBuffer: 10 * 1024 * 1024,
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "pipe"],
+  }).trim();
+  if (!modeOutput) return { path: filePath, content: null };
+
+  const mode = modeOutput.slice(0, 6);
+  if (mode !== "100644" && mode !== "100755" && mode !== "120000") {
+    throw new Error(`unsupported Git mode ${mode} for ${filePath}`);
+  }
+
+  const objectSpec = `:${filePath}`;
+  const content = execFileSync(
+    "git",
+    mode === "120000"
+      ? ["show", objectSpec]
+      : ["cat-file", "--filters", `--path=${filePath}`, objectSpec],
+    {
+      cwd,
+      env: childEnv,
+      maxBuffer: GIT_SNAPSHOT_MAX_BUFFER,
+      stdio: ["ignore", "pipe", "pipe"],
+    },
+  );
+  return { path: filePath, content, mode };
+}
+
+export function readGitIndexEntrySnapshot(
+  filePath: string,
+  { cwd, env }: GitExecOpts,
+): GitIndexEntrySnapshot {
+  const childEnv = { ...process.env, ...env };
+  const entries = execFileSync(
+    "git",
+    [
+      "--literal-pathspecs",
+      "ls-files",
+      "--stage",
+      "--no-abbrev",
+      "-z",
+      "--",
+      filePath,
+    ],
+    {
+      cwd,
+      env: childEnv,
+      maxBuffer: GIT_SNAPSHOT_MAX_BUFFER,
+      stdio: ["ignore", "pipe", "pipe"],
+    },
+  );
+  const debugOutput = execFileSync(
+    "git",
+    [
+      "--literal-pathspecs",
+      "ls-files",
+      "--debug",
+      "--format=",
+      "--",
+      filePath,
+    ],
+    {
+      cwd,
+      env: childEnv,
+      maxBuffer: GIT_SNAPSHOT_MAX_BUFFER,
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe"],
+    },
+  );
+  const flags = [...debugOutput.matchAll(/\tflags: ([0-9a-f]+)$/gim)]
+    .map((match) => match[1]);
+  const entryCount = entries.reduce(
+    (count, byte) => count + (byte === 0 ? 1 : 0),
+    0,
+  );
+  if (flags.length !== entryCount) {
+    throw new Error(`unable to read complete Git index metadata for ${filePath}`);
+  }
+  return { path: filePath, entries, flags };
+}
+
+export function gitIndexEntrySnapshotsEqual(
+  left: GitIndexEntrySnapshot,
+  right: GitIndexEntrySnapshot,
+): boolean {
+  return left.path === right.path
+    && left.entries.equals(right.entries)
+    && left.flags.length === right.flags.length
+    && left.flags.every((flag, index) => flag === right.flags[index]);
+}
+
+export function stageFileSnapshots(
+  snapshots: readonly GitFileSnapshot[],
+  { cwd, env }: GitExecOpts,
+): void {
+  for (const snapshot of snapshots) {
+    if (snapshot.content === null) {
+      gitExecSyncOrThrow(
+        ["update-index", "--force-remove", "--", snapshot.path],
+        { cwd, env },
+        `staging deletion for ${snapshot.path}`,
+      );
+      continue;
+    }
+
+    const hashArgs = ["hash-object", "-w"];
+    if (snapshot.mode !== "120000") hashArgs.push(`--path=${snapshot.path}`);
+    hashArgs.push("--stdin");
+    const hash = execFileSync("git", hashArgs, {
+      cwd,
+      env: { ...process.env, ...env },
+      input: snapshot.content,
+      maxBuffer: GIT_SNAPSHOT_MAX_BUFFER,
+      encoding: "utf8",
+    }).trim();
+    gitExecSyncOrThrow(
+      ["update-index", "--add", "--cacheinfo", snapshot.mode ?? "100644", hash, snapshot.path],
+      { cwd, env },
+      `staging ${snapshot.path}`,
+    );
   }
 }
 

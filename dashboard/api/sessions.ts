@@ -349,6 +349,7 @@ export function parseSessionList(): SessionSummary[] {
       passed,
       failed,
       skipped,
+      errors: 0,
       total,
       elapsedSec,
       tests,

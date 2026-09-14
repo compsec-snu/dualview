@@ -7,7 +7,6 @@ import {
   statSync,
   writeFileSync,
 } from "fs";
-import { createHash } from "crypto";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "path";
 import {
   acquireLock,
@@ -17,7 +16,8 @@ import {
   releaseLock,
   stageFiles,
 } from "./dualview-git.js";
-import { allocateSymbol, hasSymbols, loadSymbolMap, resolveAllSymbols, type SymbolMap } from "./dualview-symbol-table.js";
+import { hasSymbols, loadSymbolMap, resolveAllSymbols, type SymbolMap } from "./dualview-symbol-table.js";
+import { policyFileSymbolValue, symbolizePolicyFile } from "./dualview-policy-file.js";
 
 interface Logger {
   info: (msg: string) => void;
@@ -89,18 +89,6 @@ function collectFiles(root: string, relPath: string): string[] {
 
 function pathIsManaged(path: string, managedRoots: string[]): boolean {
   return managedRoots.some((root) => path === root || path.startsWith(root + sep));
-}
-
-function symbolFieldForFile(file: string): string {
-  return file.replace(/[^a-zA-Z0-9_]+/g, "_").replace(/^_+|_+$/g, "") || "content";
-}
-
-function policyFileSymbolValue(file: string, content: Buffer): string {
-  const sample = content.subarray(0, 8192);
-  if (!sample.includes(0)) return content.toString("utf8");
-
-  const sha256 = createHash("sha256").update(content).digest("hex");
-  return `[binary policy file: ${file}; bytes=${content.length}; sha256=${sha256}]`;
 }
 
 /**
@@ -187,14 +175,13 @@ export function syncPolicyDirPathsToWorktree({
       }
 
       if (shouldRegisterAsUntrusted) {
-        const sym = allocateSymbol(symbolMap, {
-          tool: "policy_file",
-          field: symbolFieldForFile(file),
-          value: text,
-          origin: `file:${file}`,
-          callId: "policy-load",
-        }, dbPath);
-        writeFileSync(trustedFile, sym);
+        symbolizePolicyFile({
+          file,
+          content,
+          targetPath: trustedFile,
+          symbolMap,
+          dbPath,
+        });
       }
     }
 

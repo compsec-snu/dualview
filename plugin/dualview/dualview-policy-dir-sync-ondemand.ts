@@ -1,5 +1,6 @@
 import {
   existsSync,
+  lstatSync,
   mkdirSync,
   readFileSync,
   readdirSync,
@@ -9,14 +10,17 @@ import {
   writeFileSync,
 } from "fs";
 import { createHash } from "crypto";
-import { dirname, isAbsolute, join, relative, resolve, sep } from "path";
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "path";
 import { gitExecSync } from "./dualview-git.js";
 import {
   dualviewGitOpts,
+  findContainingRoot,
   resolveTrackingRoot,
   type TrackedRoot,
 } from "./dualview-ondemand.js";
+import { canonicalWorkspacePath } from "./dualview-paths.js";
 import { allocateSymbol, hasSymbols, loadSymbolMap, resolveAllSymbols, type SymbolMap } from "./dualview-symbol-table.js";
+import { policyFileSymbolValue, symbolizePolicyFile } from "./dualview-policy-file.js";
 
 interface Logger {
   info: (msg: string) => void;
@@ -79,7 +83,8 @@ function isMetadataPath(path: string): boolean {
 function collectFiles(root: string, relPath: string): string[] {
   const fullPath = relPath ? join(root, relPath) : root;
   if (!existsSync(fullPath)) return [];
-  const stat = statSync(fullPath);
+  const stat = lstatSync(fullPath);
+  if (stat.isSymbolicLink()) return [relPath];
   if (stat.isFile()) return [relPath];
   if (!stat.isDirectory()) return [];
 
@@ -98,18 +103,6 @@ function pathIsManaged(path: string, managedRoots: string[]): boolean {
     if (root === "") return true;
     return path === root || path.startsWith(root + sep);
   });
-}
-
-function symbolFieldForFile(file: string): string {
-  return file.replace(/[^a-zA-Z0-9_]+/g, "_").replace(/^_+|_+$/g, "") || "content";
-}
-
-function policyFileSymbolValue(file: string, content: Buffer): string {
-  const sample = content.subarray(0, 8192);
-  if (!sample.includes(0)) return content.toString("utf8");
-
-  const sha256 = createHash("sha256").update(content).digest("hex");
-  return `[binary policy file: ${file}; bytes=${content.length}; sha256=${sha256}]`;
 }
 
 function getChangedFilesOd(root: TrackedRoot, worktree: string): ChangedFile[] {
@@ -166,17 +159,30 @@ function preparePolicyPath(policyPath: string, basePath: string): ManagedPolicyP
   const normalizedPolicyPath = policyPath.endsWith("/*") || policyPath.endsWith("\\*")
     ? policyPath.slice(0, -2)
     : policyPath;
-  const absPath = isAbsolute(normalizedPolicyPath)
+  const unresolvedPath = isAbsolute(normalizedPolicyPath)
     ? resolve(normalizedPolicyPath)
     : resolve(basePath, normalizedPolicyPath);
+  let unresolvedStat: ReturnType<typeof lstatSync> | null = null;
+  try {
+    unresolvedStat = lstatSync(unresolvedPath);
+  } catch {
+    // The policy path may be created later.
+  }
+  const absPath = unresolvedStat?.isSymbolicLink()
+    ? join(canonicalWorkspacePath(dirname(unresolvedPath)), basename(unresolvedPath))
+    : canonicalWorkspacePath(unresolvedPath);
   if (isMetadataPath(absPath)) return null;
-  if (!existsSync(absPath)) return null;
+  const stat = unresolvedStat;
+  if (stat && !stat.isFile() && !stat.isDirectory() && !stat.isSymbolicLink()) return null;
 
-  const stat = statSync(absPath);
-  if (!stat.isFile() && !stat.isDirectory()) return null;
-
-  const seedPath = stat.isDirectory() ? join(absPath, ".dualview-policy-seed") : absPath;
-  const root = resolveTrackingRoot(seedPath, { allowTemporary: true });
+  const seedPath = stat?.isDirectory()
+    ? join(absPath, ".dualview-policy-seed")
+    : stat?.isSymbolicLink()
+      ? join(dirname(absPath), ".dualview-policy-seed")
+      : absPath;
+  const root = stat
+    ? resolveTrackingRoot(seedPath, { allowTemporary: true })
+    : findContainingRoot(absPath);
   if (!root) return null;
 
   const managedRel = relative(root.workTree, absPath);
@@ -244,25 +250,32 @@ function syncRoot({
       const parent = dirname(trustedFile);
       if (!existsSync(parent)) mkdirSync(parent, { recursive: true });
 
-      const content = readFileSync(mainFile);
+      const mainStat = lstatSync(mainFile);
+      const content = mainStat.isSymbolicLink()
+        ? Buffer.from(`[blocked policy symlink: ${file}]`)
+        : readFileSync(mainFile);
       const text = policyFileSymbolValue(file, content);
       let shouldRegisterAsUntrusted = true;
       if (existsSync(trustedFile)) {
-        const trustedText = readFileSync(trustedFile, "utf8");
-        if (hasSymbols(trustedText)) {
-          shouldRegisterAsUntrusted = resolveAllSymbols(trustedText, symbolMap) !== text;
+        const trustedStat = lstatSync(trustedFile);
+        if (!trustedStat.isFile()) {
+          rmSync(trustedFile, { force: true, recursive: true });
+        } else {
+          const trustedText = readFileSync(trustedFile, "utf8");
+          if (hasSymbols(trustedText)) {
+            shouldRegisterAsUntrusted = resolveAllSymbols(trustedText, symbolMap) !== text;
+          }
         }
       }
 
       if (shouldRegisterAsUntrusted) {
-        const sym = allocateSymbol(symbolMap, {
-          tool: "policy_file",
-          field: symbolFieldForFile(file),
-          value: text,
-          origin: `file:${file}`,
-          callId: "policy-load",
-        }, dbPath);
-        writeFileSync(trustedFile, sym);
+        symbolizePolicyFile({
+          file,
+          content,
+          targetPath: trustedFile,
+          symbolMap,
+          dbPath,
+        });
       }
     }
 
@@ -355,4 +368,68 @@ export function syncPolicyDirPathsToOnDemand({
   }
 
   return result;
+}
+
+/**
+ * Restore raw trusted-view files when explicit untrusted DIR policies are
+ * removed at runtime.
+ */
+export function restorePolicyDirPathsInOnDemand({
+  policyPaths,
+  basePath,
+}: Pick<OnDemandPolicyDirSyncOptions, "policyPaths" | "basePath">): void {
+  const prepared = policyPaths
+    .map((path) => preparePolicyPath(path, basePath))
+    .filter((path): path is ManagedPolicyPath => path !== null);
+  const groups = new Map<string, RootGroup>();
+  for (const item of prepared) {
+    let group = groups.get(item.root.workTree);
+    if (!group) {
+      group = {
+        root: item.root,
+        policyPaths: new Set(),
+        managedPaths: new Set(),
+      };
+      groups.set(item.root.workTree, group);
+    }
+    group.managedPaths.add(item.managedRel);
+  }
+
+  for (const group of groups.values()) {
+    const { root, managedPaths } = group;
+    acquireLockOd(root);
+    try {
+      const managedFiles = new Set<string>();
+      for (const relRoot of managedPaths) {
+        for (const file of collectFiles(root.workTree, relRoot)) managedFiles.add(file);
+        for (const file of collectFiles(root.trustedPath, relRoot)) managedFiles.add(file);
+      }
+      for (const file of managedFiles) {
+        const mainFile = join(root.workTree, file);
+        const trustedFile = join(root.trustedPath, file);
+        if (!existsSync(mainFile)) {
+          rmSync(trustedFile, { force: true });
+          continue;
+        }
+        if (lstatSync(mainFile).isSymbolicLink()) {
+          rmSync(trustedFile, { force: true, recursive: true });
+          continue;
+        }
+        mkdirSync(dirname(trustedFile), { recursive: true });
+        if (existsSync(trustedFile) && !lstatSync(trustedFile).isFile()) {
+          rmSync(trustedFile, { force: true, recursive: true });
+        }
+        writeFileSync(trustedFile, readFileSync(mainFile));
+      }
+      const trustedChanged = getChangedFilesOd(root, root.trustedPath)
+        .map((file) => file.path)
+        .filter((path) => pathIsManaged(path, [...managedPaths]));
+      if (trustedChanged.length > 0) {
+        stageFilesOd(root, root.trustedPath, trustedChanged);
+        commitOd(root, root.trustedPath, trustedChanged);
+      }
+    } finally {
+      releaseLockOd(root);
+    }
+  }
 }

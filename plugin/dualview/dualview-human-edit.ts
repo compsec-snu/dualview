@@ -1,15 +1,37 @@
-import { appendFileSync, readFileSync, writeFileSync, existsSync, mkdirSync, rmdirSync, statSync } from "fs";
+import {
+  appendFileSync,
+  existsSync,
+  lstatSync,
+  mkdirSync,
+  readFileSync,
+  rmSync,
+  rmdirSync,
+  statSync,
+  writeFileSync,
+} from "fs";
 import { join, dirname } from "path";
 import { createHash } from "crypto";
 import {
   gitExecSync,
+  gitExecSyncOrThrow,
   getWorktreePath,
   acquireLock,
   releaseLock,
   writeConflictLog,
   ensureGitignoreExcludes,
+  fileSnapshotsEqual,
+  gitIndexEntrySnapshotsEqual,
+  readGitIndexEntrySnapshot,
+  readFilesystemSnapshot,
+  readWorktreeSnapshot,
+  stageFileSnapshots,
+  withLockedGitIndex,
+  withTemporaryGitIndex,
+  writeFilesystemSnapshot,
   type ChangedFile,
   type ConflictLogEntry,
+  type GitFileSnapshot,
+  type GitIndexEntrySnapshot,
   type GitExecOpts,
 } from "./dualview-git.js";
 import {
@@ -22,9 +44,12 @@ import {
   getSymbolPattern,
   obsoleteSymbol,
   allocateDerivedSymbol,
+  createSymbolMutationJournal,
+  rollbackSymbolMapChanges,
   type SymbolMap,
-  type SymbolEntry,
+  type SymbolMutationJournal,
 } from "./dualview-symbol-table.js";
+import { symbolizePolicyFile } from "./dualview-policy-file.js";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // DualView Human Edit Reconciliation
@@ -46,6 +71,13 @@ interface Logger {
 /** Short content digest used for race detection (issue #213 R1/R2). */
 function hashBuffer(buf: Buffer): string {
   return createHash("sha256").update(buf).digest("hex");
+}
+
+function readHumanFile(path: string, relativePath: string, policyUntrusted: boolean): Buffer {
+  if (policyUntrusted && lstatSync(path).isSymbolicLink()) {
+    return Buffer.from(`[blocked policy symlink: ${relativePath}]`);
+  }
+  return readFileSync(path);
 }
 
 // ── Line Map ────────────────────────────────────────────────────────────────
@@ -161,6 +193,7 @@ export function splitSymbol(
   symName: string,
   editRanges: EditRange[],
   dbPath?: string,
+  journal?: SymbolMutationJournal,
 ): SplitPiece[] {
   const entry = symbolMap.symbols.get(symName);
   if (!entry) throw new Error(`Unknown symbol: ${symName}`);
@@ -183,7 +216,7 @@ export function splitSymbol(
         lineStart: cursor,
         lineEnd: edit.start,
         splitIndex: derivedIndex++,
-      }, dbPath);
+      }, dbPath, journal);
       pieces.push({ type: "symbol", symName: derivedSym });
     }
 
@@ -201,12 +234,12 @@ export function splitSymbol(
       lineStart: cursor,
       lineEnd: valueLines.length,
       splitIndex: derivedIndex++,
-    }, dbPath);
+    }, dbPath, journal);
     pieces.push({ type: "symbol", symName: derivedSym });
   }
 
   // Obsolete the original
-  obsoleteSymbol(symbolMap, symName, "human", dbPath);
+  obsoleteSymbol(symbolMap, symName, "human", dbPath, journal);
 
   return pieces;
 }
@@ -230,6 +263,10 @@ export interface ReconcileOptions {
   dbPath?: string;
   log?: Logger;
   auditWrite?: (entry: object) => void;
+  symbolMap?: SymbolMap;
+  isPolicyUntrusted?: (absolutePath: string) => boolean;
+  /** Limit reconciliation to paths within the configured workspace scope. */
+  pathFilter?: (filePath: string) => boolean;
 }
 
 interface ReconcileGitContext {
@@ -237,6 +274,8 @@ interface ReconcileGitContext {
   trustedPath: string;
   humanGit: GitExecOpts;
   trustedGit: GitExecOpts;
+  humanIndexIsShadow: boolean;
+  pendingPath: string;
   acquire: () => void;
   release: () => void;
   writeConflict: (entry: ConflictLogEntry) => void;
@@ -245,7 +284,11 @@ interface ReconcileGitContext {
 const ONDEMAND_LOCK_STALE_MS = 30_000;
 
 function getChangedFilesFor(opts: GitExecOpts): ChangedFile[] {
-  const { stdout } = gitExecSync(["status", "--porcelain"], opts);
+  const { stdout } = gitExecSyncOrThrow(
+    ["status", "--porcelain", "--untracked-files=all"],
+    opts,
+    "reading worktree status",
+  );
   if (!stdout.trim()) return [];
   return stdout
     .trim()
@@ -256,22 +299,103 @@ function getChangedFilesFor(opts: GitExecOpts): ChangedFile[] {
     }));
 }
 
-function stageFilesFor(opts: GitExecOpts, filePaths: string[]): void {
-  if (filePaths.length === 0) return;
-  gitExecSync(["add", "--", ...filePaths], opts);
+function readPendingPaths(pendingPath: string): string[] {
+  try {
+    const parsed = JSON.parse(readFileSync(pendingPath, "utf8"));
+    return Array.isArray(parsed)
+      ? parsed.filter((item): item is string => typeof item === "string")
+      : [];
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") return [];
+    throw err;
+  }
+}
+
+function writePendingPaths(pendingPath: string, paths: Iterable<string>): void {
+  const unique = [...new Set(paths)].sort();
+  if (unique.length === 0) {
+    rmSync(pendingPath, { force: true });
+    return;
+  }
+  const parentDir = dirname(pendingPath);
+  if (!existsSync(parentDir)) mkdirSync(parentDir, { recursive: true });
+  writeFileSync(pendingPath, JSON.stringify(unique));
+}
+
+function addPendingPaths(pendingPath: string, paths: Iterable<string>): void {
+  writePendingPaths(pendingPath, [...readPendingPaths(pendingPath), ...paths]);
+}
+
+function committedChangedPaths(
+  git: ReconcileGitContext,
+  fromHead: string,
+  toHead: string,
+  pathFilter?: (filePath: string) => boolean,
+): string[] {
+  const output = gitExecSyncOrThrow(
+    ["diff", "--no-renames", "--name-only", "-z", fromHead, toHead],
+    git.humanGit,
+    "reading concurrent committed paths",
+  ).stdout;
+  return output
+    .split("\0")
+    .filter((filePath) => filePath && (!pathFilter || pathFilter(filePath)));
 }
 
 function dualviewHumanCommitFor(
   opts: GitExecOpts,
   { files, promotedSymbols }: { files: string[]; promotedSymbols: string[] },
 ): void {
+  const msg = dualviewHumanCommitMessage(files, promotedSymbols);
+  gitExecSyncOrThrow(
+    ["commit", "-m", msg, "--allow-empty"],
+    opts,
+    "Human reconciliation commit",
+  );
+}
+
+function dualviewHumanCommitMessage(
+  files: string[],
+  promotedSymbols: string[],
+): string {
   const filesList = files.join(",");
   const promoted = promotedSymbols.length > 0 ? promotedSymbols.join(",") : "none";
-  const msg = `[DUALVIEW-HUMAN] dualview: source=human files=${filesList} promoted=${promoted}`;
-  const { stderr } = gitExecSync(["commit", "-m", msg, "--allow-empty"], opts);
-  if (stderr && (stderr.includes("fatal:") || stderr.includes("error:"))) {
-    throw new Error(`git commit failed: ${stderr.trim()}`);
-  }
+  return `[DUALVIEW-HUMAN] dualview: source=human files=${filesList} promoted=${promoted}`;
+}
+
+function publishFixedHumanCommit(
+  opts: GitExecOpts,
+  expectedHead: string,
+  snapshots: readonly GitFileSnapshot[],
+  files: string[],
+  promotedSymbols: string[],
+): string {
+  return withTemporaryGitIndex(opts, expectedHead, (commitGit) => {
+    stageFileSnapshots(snapshots, commitGit);
+    const tree = gitExecSyncOrThrow(
+      ["write-tree"],
+      commitGit,
+      "writing fixed-mode Human tree",
+    ).stdout.trim();
+    const commit = gitExecSyncOrThrow(
+      [
+        "commit-tree",
+        tree,
+        "-p",
+        expectedHead,
+        "-m",
+        dualviewHumanCommitMessage(files, promotedSymbols),
+      ],
+      commitGit,
+      "creating fixed-mode Human commit",
+    ).stdout.trim();
+    gitExecSyncOrThrow(
+      ["update-ref", "HEAD", commit, expectedHead],
+      opts,
+      "publishing fixed-mode Human commit",
+    );
+    return commit;
+  });
 }
 
 function acquireOnDemandLock(root: TrackedRoot): void {
@@ -328,6 +452,8 @@ function buildGitContext({ gitRoot, trackedRoot }: ReconcileOptions): ReconcileG
       trustedPath: trackedRoot.trustedPath,
       humanGit: dualviewGitOpts(trackedRoot),
       trustedGit: dualviewGitOpts(trackedRoot, trackedRoot.trustedPath),
+      humanIndexIsShadow: true,
+      pendingPath: join(dirname(trackedRoot.trustedPath), "pending-human-reconcile.json"),
       acquire: () => acquireOnDemandLock(trackedRoot),
       release: () => releaseOnDemandLock(trackedRoot),
       writeConflict: (entry) => writeOnDemandConflictLog(trackedRoot, entry),
@@ -346,6 +472,8 @@ function buildGitContext({ gitRoot, trackedRoot }: ReconcileOptions): ReconcileG
     trustedPath: getWorktreePath(gitRoot),
     humanGit: { cwd: gitRoot },
     trustedGit: { cwd: getWorktreePath(gitRoot) },
+    humanIndexIsShadow: false,
+    pendingPath: join(dirname(getWorktreePath(gitRoot)), "pending-human-reconcile.json"),
     acquire: () => acquireLock(gitRoot),
     release: () => releaseLock(gitRoot),
     writeConflict: (entry) => writeConflictLog(gitRoot, entry),
@@ -360,37 +488,75 @@ function buildGitContext({ gitRoot, trackedRoot }: ReconcileOptions): ReconcileG
 export function reconcileHumanEdits(
   opts: ReconcileOptions,
 ): ReconcileResult | null {
-  const { dbPath, log, auditWrite } = opts;
+  const { dbPath, log, auditWrite, isPolicyUntrusted, pathFilter } = opts;
   const git = buildGitContext(opts);
 
   // 1. Detect uncommitted changes in human-view
-  const changed = getChangedFilesFor(git.humanGit);
+  const changedByPath = new Map(
+    getChangedFilesFor(git.humanGit)
+      .filter((file) => !pathFilter || pathFilter(file.path))
+      .map((file) => [file.path, file]),
+  );
+  for (const filePath of readPendingPaths(git.pendingPath)) {
+    if (changedByPath.has(filePath) || (pathFilter && !pathFilter(filePath))) continue;
+    try {
+      if (lstatSync(join(git.humanPath, filePath)).isDirectory()) continue;
+      changedByPath.set(filePath, { status: "M", path: filePath });
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
+      changedByPath.set(filePath, { status: "D", path: filePath });
+    }
+  }
+  const changed = [...changedByPath.values()];
   if (changed.length === 0) return null;
-
   if (!existsSync(git.trustedPath)) return null;
 
   if (log) log.info(`[DualView-human-edit] Detected ${changed.length} uncommitted change(s) in human-view`);
 
   git.acquire();
   try {
-    const symbolMap = loadSymbolMap(dbPath);
+    const persistedSymbols = loadSymbolMap(dbPath);
+    const symbolMap = opts.symbolMap ?? persistedSymbols;
+    if (opts.symbolMap) {
+      for (const [name, entry] of persistedSymbols.symbols) {
+        if (!symbolMap.symbols.has(name)) symbolMap.symbols.set(name, entry);
+      }
+    }
+    const symbolJournal = createSymbolMutationJournal();
+    const humanHead = gitExecSyncOrThrow(
+      ["rev-parse", "HEAD"],
+      git.humanGit,
+      "reading Human branch HEAD",
+    ).stdout.trim();
+    const trustedHead = gitExecSyncOrThrow(
+      ["rev-parse", "HEAD"],
+      git.trustedGit,
+      "reading trusted branch HEAD",
+    ).stdout.trim();
     const reconciledFiles: string[] = [];
-    const allPromoted: string[] = [];
-    // Pre-reconcile hashes of the human-view file contents (issue #213 R1).
-    // A concurrent human save between read and commit would invalidate the
-    // reconcile we computed against the pre-save content; before staging we
-    // re-hash and drop any file whose disk content has since changed.
-    const preHashes = new Map<string, string | null>();
+    const trustedBefore = new Map<string, GitFileSnapshot>();
+    const pending = new Map<string, {
+      humanSnapshot: GitFileSnapshot;
+      applyTrusted: () => string[];
+    }>();
+    const preSnapshots = new Map<string, GitFileSnapshot>();
 
     for (const file of changed) {
       // Only process modified files (not deleted/untracked without content)
       if (file.status === "D") {
-        // Deletion: remove from trusted worktree too
         const trustedFile = join(git.trustedPath, file.path);
-        if (existsSync(trustedFile)) {
-          gitExecSync(["rm", "-f", "--", file.path], git.trustedGit);
+        const trustedSnapshot = readFilesystemSnapshot(trustedFile, file.path);
+        if (trustedSnapshot.content !== null) {
           reconciledFiles.push(file.path);
-          preHashes.set(file.path, null); // expected absent after commit
+          trustedBefore.set(file.path, trustedSnapshot);
+          preSnapshots.set(file.path, { path: file.path, content: null });
+          pending.set(file.path, {
+            humanSnapshot: { path: file.path, content: null },
+            applyTrusted: () => {
+              rmSync(trustedFile, { recursive: true, force: true });
+              return [];
+            },
+          });
         }
         continue;
       }
@@ -398,62 +564,119 @@ export function reconcileHumanEdits(
       const humanFilePath = join(git.humanPath, file.path);
       const trustedFilePath = join(git.trustedPath, file.path);
 
-      if (!existsSync(humanFilePath)) continue;
-      if (statSync(humanFilePath).isDirectory()) continue;
+      let humanStat: ReturnType<typeof lstatSync>;
+      try {
+        humanStat = lstatSync(humanFilePath);
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code === "ENOENT") continue;
+        throw err;
+      }
+      if (humanStat.isDirectory()) continue;
 
       // Capture the human-view content *now*, use this buffer for every
-      // downstream decision, and key the post-commit hash recheck off it.
-      const humanContent = readFileSync(humanFilePath);
-      const preHash = hashBuffer(humanContent);
+      // downstream decision, including file type and executable mode.
+      const policyUntrusted = isPolicyUntrusted?.(humanFilePath) === true;
+      const humanSnapshot = readFilesystemSnapshot(humanFilePath, file.path);
+      const humanContent = policyUntrusted
+        ? readHumanFile(humanFilePath, file.path, true)
+        : humanSnapshot.content!;
+      const trustedSnapshot = readFilesystemSnapshot(trustedFilePath, file.path);
+      trustedBefore.set(file.path, trustedSnapshot);
+      const copyHumanContent = () => {
+        writeFilesystemSnapshot(trustedFilePath, humanSnapshot);
+        return [];
+      };
+
+      if (policyUntrusted) {
+        reconciledFiles.push(file.path);
+        preSnapshots.set(file.path, humanSnapshot);
+        pending.set(file.path, {
+          humanSnapshot,
+          applyTrusted: () => {
+            symbolizePolicyFile({
+              file: file.path,
+              content: humanContent,
+              targetPath: trustedFilePath,
+              symbolMap,
+              dbPath,
+              callId: "human-edit",
+              journal: symbolJournal,
+            });
+            return [];
+          },
+        });
+        continue;
+      }
 
       // For new files (status ??, A): copy to trusted worktree as-is
       if (file.status === "??" || file.status === "A") {
-        const parentDir = dirname(trustedFilePath);
-        if (!existsSync(parentDir)) mkdirSync(parentDir, { recursive: true });
-        writeFileSync(trustedFilePath, humanContent);
         reconciledFiles.push(file.path);
-        preHashes.set(file.path, preHash);
+        preSnapshots.set(file.path, humanSnapshot);
+        pending.set(file.path, {
+          humanSnapshot,
+          applyTrusted: copyHumanContent,
+        });
         continue;
       }
 
       // Modified file: check if trusted worktree version has symbols
-      if (!existsSync(trustedFilePath)) {
-        // File exists in human-view but not trusted — copy as-is
-        const parentDir = dirname(trustedFilePath);
-        if (!existsSync(parentDir)) mkdirSync(parentDir, { recursive: true });
-        writeFileSync(trustedFilePath, humanContent);
+      if (trustedSnapshot.content === null) {
         reconciledFiles.push(file.path);
-        preHashes.set(file.path, preHash);
+        preSnapshots.set(file.path, humanSnapshot);
+        pending.set(file.path, {
+          humanSnapshot,
+          applyTrusted: copyHumanContent,
+        });
         continue;
       }
 
-      // Skip binary files
-      if (humanContent.subarray(0, 8192).includes(0)) continue;
+      // Symlinks and binary files do not contain reconcilable symbols.
+      if (humanSnapshot.mode === "120000"
+        || trustedSnapshot.mode === "120000"
+        || humanContent.subarray(0, 8192).includes(0)) {
+        reconciledFiles.push(file.path);
+        preSnapshots.set(file.path, humanSnapshot);
+        pending.set(file.path, {
+          humanSnapshot,
+          applyTrusted: copyHumanContent,
+        });
+        continue;
+      }
 
-      const trustedContent = readFileSync(trustedFilePath, "utf8");
+      const trustedContent = trustedSnapshot.content.toString("utf8");
 
       // If trusted file has no symbols, simple case: just copy
       if (!hasSymbols(trustedContent)) {
-        writeFileSync(trustedFilePath, humanContent);
         reconciledFiles.push(file.path);
-        preHashes.set(file.path, preHash);
+        preSnapshots.set(file.path, humanSnapshot);
+        pending.set(file.path, {
+          humanSnapshot,
+          applyTrusted: copyHumanContent,
+        });
         continue;
       }
 
-      // Build line map and reconcile
       const humanText = humanContent.toString("utf8");
-      const promoted = reconcileFile(
-        trustedContent,
-        humanText,
-        trustedFilePath,
-        symbolMap,
-        dbPath,
-        log,
-      );
-
-      allPromoted.push(...promoted);
       reconciledFiles.push(file.path);
-      preHashes.set(file.path, preHash);
+      preSnapshots.set(file.path, humanSnapshot);
+      pending.set(file.path, {
+        humanSnapshot,
+        applyTrusted: () => {
+          const reconciled = reconcileFile(
+            trustedContent,
+            humanText,
+            symbolMap,
+            dbPath,
+            log,
+            symbolJournal,
+          );
+          writeFilesystemSnapshot(trustedFilePath, {
+            ...humanSnapshot,
+            content: Buffer.from(reconciled.content),
+          });
+          return reconciled.promotedSymbols;
+        },
+      });
     }
 
     // Race guard (issue #213 R1): the lock serialises DualView processes but not
@@ -461,50 +684,295 @@ export function reconcileHumanEdits(
     // human could have saved again; that new content would be staged under
     // a commit whose reconcile logic never saw it. Re-hash every file we're
     // about to stage and drop any whose on-disk content has shifted.
-    const safeFiles: string[] = [];
-    for (const path of reconciledFiles) {
-      const expected = preHashes.get(path) ?? null;
-      const onDisk = existsSync(join(git.humanPath, path))
-        ? hashBuffer(readFileSync(join(git.humanPath, path)))
-        : null;
-      if (expected === onDisk) {
-        safeFiles.push(path);
-        continue;
+    const stableFiles = (filePaths: readonly string[]): string[] => {
+      const safe: string[] = [];
+      for (const filePath of filePaths) {
+        const expected = preSnapshots.get(filePath)!;
+        const onDisk = readWorktreeSnapshot(git.humanPath, filePath);
+        if (fileSnapshotsEqual(expected, onDisk)) {
+          safe.push(filePath);
+          continue;
+        }
+        const expectedHash = expected.content === null ? null : hashBuffer(expected.content);
+        const observedHash = onDisk.content === null ? null : hashBuffer(onDisk.content);
+        git.writeConflict({
+          race: "R1",
+          source: "reconcileHumanEdits",
+          target: filePath,
+          reason: "human-view content changed during reconcile window",
+          extra: {
+            expectedHash,
+            observedHash,
+            expectedMode: expected.mode,
+            observedMode: onDisk.mode,
+          },
+        });
+        if (log) {
+          log.warn(
+            `[DualView-human-edit] R1 race: dropping ${filePath} (pre=${expectedHash ?? "absent"} post=${observedHash ?? "absent"})`,
+          );
+        }
       }
-      git.writeConflict({
-        race: "R1",
-        source: "reconcileHumanEdits",
-        target: path,
-        reason: "human-view content changed during reconcile window",
-        extra: { expectedHash: expected, observedHash: onDisk },
-      });
-      if (log) {
-        log.warn(
-          `[DualView-human-edit] R1 race: dropping ${path} (pre=${expected ?? "absent"} post=${onDisk ?? "absent"})`,
-        );
-      }
-    }
+      return safe;
+    };
 
+    let safeFiles = stableFiles(reconciledFiles);
     if (safeFiles.length === 0) {
       return null;
     }
 
-    // Commit human-view as [DUALVIEW-HUMAN]
-    stageFilesFor(git.humanGit, safeFiles);
-    dualviewHumanCommitFor(git.humanGit, {
-      files: safeFiles,
-      promotedSymbols: allPromoted,
-    });
-
-    // Commit trusted worktree
-    const trustedChanged = getChangedFilesFor(git.trustedGit);
-    if (trustedChanged.length > 0) {
-      stageFilesFor(git.trustedGit, trustedChanged.map((f) => f.path));
-      dualviewHumanCommitFor(git.trustedGit, {
-        files: safeFiles,
-        promotedSymbols: allPromoted,
+    safeFiles = stableFiles(safeFiles);
+    if (safeFiles.length === 0) {
+      return null;
+    }
+    const fixedIndexBefore = new Map<string, GitIndexEntrySnapshot>();
+    const fixedHeadEntries = new Map<string, GitIndexEntrySnapshot>();
+    if (!git.humanIndexIsShadow) {
+      for (const filePath of safeFiles) {
+        fixedIndexBefore.set(
+          filePath,
+          readGitIndexEntrySnapshot(filePath, git.humanGit),
+        );
+      }
+      withTemporaryGitIndex(git.humanGit, humanHead, (headGit) => {
+        for (const filePath of safeFiles) {
+          fixedHeadEntries.set(
+            filePath,
+            readGitIndexEntrySnapshot(filePath, headGit),
+          );
+        }
       });
     }
+
+    const allPromoted: string[] = [];
+    let publishedHumanCommit: string | null = null;
+    try {
+      for (const filePath of safeFiles) {
+        const operation = pending.get(filePath);
+        if (operation) allPromoted.push(...operation.applyTrusted());
+      }
+
+      // Commit trusted worktree
+      const trustedChanged = getChangedFilesFor(git.trustedGit)
+        .filter((file) => safeFiles.includes(file.path));
+      if (trustedChanged.length > 0) {
+        gitExecSyncOrThrow(
+          ["reset", "--mixed", "--quiet", "HEAD"],
+          git.trustedGit,
+          "resetting trusted shadow index",
+        );
+        stageFileSnapshots(
+          trustedChanged.map((file) => readWorktreeSnapshot(git.trustedPath, file.path)),
+          git.trustedGit,
+        );
+        dualviewHumanCommitFor(git.trustedGit, {
+          files: safeFiles,
+          promotedSymbols: allPromoted,
+        });
+      }
+
+      const humanSnapshots = safeFiles.map(
+        (filePath) => pending.get(filePath)!.humanSnapshot,
+      );
+      if (git.humanIndexIsShadow) {
+        // The on-demand index is internal DualView state. Rebuild it from HEAD
+        // so pre-staged paths outside this accepted set cannot leak.
+        gitExecSyncOrThrow(
+          ["reset", "--mixed", "--quiet", "HEAD"],
+          git.humanGit,
+          "resetting Human shadow index",
+        );
+        stageFileSnapshots(humanSnapshots, git.humanGit);
+        dualviewHumanCommitFor(git.humanGit, {
+          files: safeFiles,
+          promotedSymbols: allPromoted,
+        });
+      } else {
+        // Publish only if the user's branch still points to the snapshot this
+        // reconciliation read.
+        publishedHumanCommit = publishFixedHumanCommit(
+          git.humanGit,
+          humanHead,
+          humanSnapshots,
+          safeFiles,
+          allPromoted,
+        );
+        const currentHumanHead = gitExecSyncOrThrow(
+          ["rev-parse", "HEAD"],
+          git.humanGit,
+          "checking fixed-mode Human branch after publish",
+        ).stdout.trim();
+        if (currentHumanHead !== publishedHumanCommit) {
+          addPendingPaths(
+            git.pendingPath,
+            committedChangedPaths(
+              git,
+              publishedHumanCommit,
+              currentHumanHead,
+              pathFilter,
+            ),
+          );
+          throw new Error(
+            "Human branch advanced after reconciliation commit; committed paths require another reconciliation pass",
+          );
+        }
+
+        withLockedGitIndex(git.humanGit, (lockedIndexGit) => {
+          const lockedHead = gitExecSyncOrThrow(
+            ["rev-parse", "HEAD"],
+            git.humanGit,
+            "checking fixed-mode Human branch while refreshing the index",
+          ).stdout.trim();
+          if (lockedHead !== publishedHumanCommit) {
+            addPendingPaths(
+              git.pendingPath,
+              committedChangedPaths(
+                git,
+                publishedHumanCommit!,
+                lockedHead,
+                pathFilter,
+              ),
+            );
+            throw new Error(
+              "Human branch advanced while refreshing the user index",
+            );
+          }
+
+          const refreshable = safeFiles.filter((filePath) => {
+            const before = fixedIndexBefore.get(filePath)!;
+            const current = readGitIndexEntrySnapshot(filePath, lockedIndexGit);
+            return gitIndexEntrySnapshotsEqual(before, current)
+              && gitIndexEntrySnapshotsEqual(
+                before,
+                fixedHeadEntries.get(filePath)!,
+              );
+          });
+          if (refreshable.length > 0) {
+            gitExecSyncOrThrow(
+              ["reset", "--quiet", publishedHumanCommit!, "--", ...refreshable],
+              lockedIndexGit,
+              "refreshing reconciled paths in the user index",
+            );
+          }
+        });
+
+        const headAfterIndexRefresh = gitExecSyncOrThrow(
+          ["rev-parse", "HEAD"],
+          git.humanGit,
+          "checking fixed-mode Human branch after index refresh",
+        ).stdout.trim();
+        if (headAfterIndexRefresh !== publishedHumanCommit) {
+          addPendingPaths(
+            git.pendingPath,
+            committedChangedPaths(
+              git,
+              publishedHumanCommit,
+              headAfterIndexRefresh,
+              pathFilter,
+            ),
+          );
+          throw new Error(
+            "Human branch advanced after index refresh; committed paths require another reconciliation pass",
+          );
+        }
+      }
+    } catch (err) {
+      const rollbackErrors: string[] = [];
+      let preservePublishedState = false;
+      const rollback = (label: string, action: () => void) => {
+        try {
+          action();
+        } catch (rollbackErr) {
+          rollbackErrors.push(`${label}: ${(rollbackErr as Error).message}`);
+        }
+      };
+
+      if (!git.humanIndexIsShadow && !publishedHumanCommit) {
+        rollback("pending committed paths", () => {
+          const currentHead = gitExecSyncOrThrow(
+            ["rev-parse", "HEAD"],
+            git.humanGit,
+            "checking Human branch after publish conflict",
+          ).stdout.trim();
+          if (currentHead !== humanHead) {
+            addPendingPaths(
+              git.pendingPath,
+              committedChangedPaths(git, humanHead, currentHead, pathFilter),
+            );
+          }
+        });
+      }
+
+      rollback("Human branch", () => {
+        if (git.humanIndexIsShadow) {
+          gitExecSyncOrThrow(
+            ["reset", "--mixed", "--quiet", humanHead],
+            git.humanGit,
+            "rolling back Human branch",
+          );
+        } else if (publishedHumanCommit) {
+          const result = gitExecSync(
+            ["update-ref", "HEAD", humanHead, publishedHumanCommit],
+            git.humanGit,
+          );
+          if (result.code !== 0) {
+            preservePublishedState = true;
+            const currentHead = gitExecSyncOrThrow(
+              ["rev-parse", "HEAD"],
+              git.humanGit,
+              "checking advanced Human branch during rollback",
+            ).stdout.trim();
+            addPendingPaths(
+              git.pendingPath,
+              committedChangedPaths(
+                git,
+                publishedHumanCommit!,
+                currentHead,
+                pathFilter,
+              ),
+            );
+            rollbackErrors.push(
+              `Human branch advanced after ${publishedHumanCommit}; not rewinding it`,
+            );
+          }
+        }
+      });
+      if (!preservePublishedState) {
+        rollback("trusted branch", () => {
+          gitExecSyncOrThrow(
+            ["reset", "--mixed", "--quiet", trustedHead],
+            git.trustedGit,
+            "rolling back trusted branch",
+          );
+          for (const filePath of safeFiles) {
+            writeFilesystemSnapshot(
+              join(git.trustedPath, filePath),
+              trustedBefore.get(filePath)!,
+            );
+          }
+        });
+        rollback("symbol table", () => {
+          rollbackSymbolMapChanges(symbolJournal, dbPath);
+          for (const symName of symbolJournal.inserted.keys()) {
+            symbolMap.symbols.delete(symName);
+          }
+          for (const [symName, change] of symbolJournal.updated) {
+            symbolMap.symbols.set(symName, { ...change.before });
+          }
+        });
+      }
+
+      if (rollbackErrors.length > 0) {
+        throw new Error(
+          `${(err as Error).message}; reconciliation rollback failed: ${rollbackErrors.join("; ")}`,
+        );
+      }
+      throw err;
+    }
+
+    const pendingAfter = readPendingPaths(git.pendingPath)
+      .filter((filePath) => !safeFiles.includes(filePath));
+    writePendingPaths(git.pendingPath, pendingAfter);
 
     if (log) {
       log.info(`[DualView-human-edit] Reconciled ${safeFiles.length} file(s), promoted ${allPromoted.length} symbol(s)`);
@@ -537,11 +1005,11 @@ export function reconcileHumanEdits(
 function reconcileFile(
   trustedContent: string,
   humanContent: string,
-  trustedFilePath: string,
   symbolMap: SymbolMap,
   dbPath?: string,
   log?: Logger,
-): string[] {
+  symbolJournal?: SymbolMutationJournal,
+): { content: string; promotedSymbols: string[] } {
   const segments = buildLineMap(trustedContent, symbolMap);
   const humanLines = humanContent.split("\n");
   const promoted: string[] = [];
@@ -599,14 +1067,14 @@ function reconcileFile(
       for (const line of humanSlice) {
         newTrustedLines.push(line);
       }
-      obsoleteSymbol(symbolMap, symName, "human", dbPath);
+      obsoleteSymbol(symbolMap, symName, "human", dbPath, symbolJournal);
       promoted.push(symName);
       if (log) log.info(`[DualView-human-edit] Full promotion: ${symName}`);
       continue;
     }
 
     // Partial edit: split the symbol
-    const pieces = splitSymbol(symbolMap, symName, editRanges, dbPath);
+    const pieces = splitSymbol(symbolMap, symName, editRanges, dbPath, symbolJournal);
     promoted.push(symName);
 
     for (const piece of pieces) {
@@ -624,10 +1092,10 @@ function reconcileFile(
     }
   }
 
-  // Write the updated trusted file
-  writeFileSync(trustedFilePath, newTrustedLines.join("\n"));
-
-  return promoted;
+  return {
+    content: newTrustedLines.join("\n"),
+    promotedSymbols: promoted,
+  };
 }
 
 /**

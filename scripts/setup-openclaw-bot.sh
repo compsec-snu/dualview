@@ -30,7 +30,8 @@ Options:
                          (default: tmp-runs/bot/generated/openclaw-bot.json)
   --port <port>          Gateway port passed to run-bot.sh (default: 18800)
   --seed-gws-demo        Seed local fws Gmail/Calendar/Drive demo data on start
-  --model <model-id>     Bot model (default: openai-codex/gpt-5.3-codex-spark)
+  --model <model-id>     Bot model (default: OpenRouter Qwen when configured,
+                         then Foundry Qwen, then Codex)
   --dualview-targets <csv>
                          Comma-separated DualView target channels/session ids.
                          Example: slack:C0123456789
@@ -65,6 +66,11 @@ Environment:
   DISCORD_CHANNELS       Comma-separated Discord channel IDs applied to each guild
 
   DUALVIEW_BOT_MODEL     Bot model when --model is unset
+  OPENROUTER_API_KEY     OpenRouter API key
+  OPENROUTER_MODEL       OpenRouter model ID (default: qwen/qwen3.5-9b)
+  FOUNDRY_ENDPOINT       Microsoft Foundry project endpoint
+  FOUNDRY_KEY            Microsoft Foundry API key
+  FOUNDRY_MODEL          Foundry deployment name (default: qwen35-4b)
   DUALVIEW_BOT_INSPECT_MODEL
                          Model for inspect_symbol U-LLM fallback/logging
   DUALVIEW_TARGET_CHANNELS
@@ -144,9 +150,10 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-if [ -f "$DUALVIEW_ROOT/.env" ]; then
+DUALVIEW_ENV_FILE="${DUALVIEW_ENV_FILE:-$DUALVIEW_ROOT/.env}"
+if [ -f "$DUALVIEW_ENV_FILE" ]; then
   set -a
-  source "$DUALVIEW_ROOT/.env"
+  source "$DUALVIEW_ENV_FILE"
   set +a
 fi
 
@@ -224,13 +231,21 @@ fi
 # shellcheck source=scripts/lib/check-bot-env.sh
 source "$DUALVIEW_ROOT/scripts/lib/check-bot-env.sh"
 if [ "$RUN_BOT" -eq 1 ]; then
-  require_llm_credential || exit 1
+  require_llm_credential foundry || exit 1
   case ",${CHANNELS_ARG,,}," in
     *,slack,*) require_slack_env || exit 1 ;;
   esac
 fi
 
-BOT_MODEL_ARG="${BOT_MODEL_ARG:-${DUALVIEW_BOT_MODEL:-openai-codex/gpt-5.3-codex-spark}}"
+if [ -z "$BOT_MODEL_ARG" ] && [ -z "${DUALVIEW_BOT_MODEL:-}" ] \
+    && [ -n "${OPENROUTER_API_KEY:-}" ]; then
+  BOT_MODEL_ARG="openrouter/${OPENROUTER_MODEL:-qwen/qwen3.5-9b}"
+elif [ -z "$BOT_MODEL_ARG" ] && [ -z "${DUALVIEW_BOT_MODEL:-}" ] \
+    && [ -n "${FOUNDRY_ENDPOINT:-}" ] && [ -n "${FOUNDRY_KEY:-}" ]; then
+  BOT_MODEL_ARG="microsoft-foundry/${FOUNDRY_MODEL:-qwen35-4b}"
+else
+  BOT_MODEL_ARG="${BOT_MODEL_ARG:-${DUALVIEW_BOT_MODEL:-openai-codex/gpt-5.3-codex-spark}}"
+fi
 DUALVIEW_TARGETS_ARG="${DUALVIEW_TARGETS_ARG:-${DUALVIEW_TARGET_CHANNELS:-}}"
 DUALVIEW_DISABLED_TARGETS_ARG="${DUALVIEW_DISABLED_TARGETS_ARG:-${DUALVIEW_DISABLED_TARGET_CHANNELS:-}}"
 
@@ -349,6 +364,44 @@ bot_model = env("DUALVIEW_SETUP_MODEL", "openai-codex/gpt-5.3-codex-spark")
 inspect_model = env("DUALVIEW_BOT_INSPECT_MODEL") or bot_model
 agent_defaults = cfg.setdefault("agents", {}).setdefault("defaults", {})
 agent_defaults["model"] = {"primary": bot_model}
+if bot_model.startswith("microsoft-foundry/"):
+    foundry_endpoint = env("FOUNDRY_ENDPOINT").rstrip("/")
+    foundry_key = env("FOUNDRY_KEY")
+    foundry_model = bot_model.removeprefix("microsoft-foundry/")
+    if not foundry_endpoint or not foundry_key:
+        raise SystemExit(
+            "Microsoft Foundry model selected but FOUNDRY_ENDPOINT or FOUNDRY_KEY is missing"
+        )
+    if not foundry_model:
+        raise SystemExit("Microsoft Foundry model selected without a deployment name")
+    if "/api/projects/" in foundry_endpoint:
+        foundry_endpoint = foundry_endpoint.split("/api/projects/", 1)[0] + "/openai/v1"
+    elif not foundry_endpoint.endswith("/openai/v1"):
+        foundry_endpoint += "/openai/v1"
+    cfg.setdefault("models", {}).setdefault("providers", {})["microsoft-foundry"] = {
+        "baseUrl": foundry_endpoint,
+        "apiKey": "${FOUNDRY_KEY}",
+        "api": "openai-completions",
+        "models": [
+            {
+                "id": foundry_model,
+                "name": "Qwen3.5-4B on Microsoft Foundry",
+                "reasoning": False,
+                "input": ["text", "image"],
+                "cost": {
+                    "input": 0,
+                    "output": 0,
+                    "cacheRead": 0,
+                    "cacheWrite": 0,
+                },
+                "contextWindow": 262144,
+                "maxTokens": 32768,
+                "compat": {
+                    "maxTokensField": "max_completion_tokens",
+                },
+            }
+        ],
+    }
 dualview_cfg = cfg.setdefault("plugins", {}).setdefault("entries", {}).setdefault("dualview", {}).setdefault("config", {})
 dualview_cfg["inspectModel"] = inspect_model
 cfg.setdefault("tools", {}).setdefault("web", {}).setdefault("search", {}).pop("apiKey", None)

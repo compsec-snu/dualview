@@ -2,11 +2,18 @@ import type { ModelDefinitionConfig } from "../config/types.js";
 
 const DEFAULT_CONTEXT_WINDOW = 128_000;
 const DEFAULT_MAX_TOKENS = 8192;
+const COPILOT_HEADERS = {
+  "User-Agent": "GitHubCopilotChat/0.35.0",
+  "Editor-Version": "vscode/1.107.0",
+  "Editor-Plugin-Version": "copilot-chat/0.35.0",
+  "Copilot-Integration-Id": "vscode-chat",
+};
 
 // Copilot model ids vary by plan/org and can change.
 // We keep this list intentionally broad; if a model isn't available Copilot will
 // return an error and users can remove it from their config.
 const DEFAULT_MODEL_IDS = [
+  "claude-sonnet-5",
   "claude-sonnet-4.6",
   "claude-sonnet-4.5",
   "gpt-4o",
@@ -27,17 +34,16 @@ export function buildCopilotModelDefinition(modelId: string): ModelDefinitionCon
   if (!id) {
     throw new Error("Model id required");
   }
+  const isClaude = id.startsWith("claude-");
   return {
     id,
     name: id,
-    // pi-coding-agent's registry schema doesn't know about a "github-copilot" API.
-    // We use OpenAI-compatible responses API, while keeping the provider id as
-    // "github-copilot" (pi-ai uses that to attach Copilot-specific headers).
-    api: "openai-responses",
-    reasoning: false,
+    api: isClaude ? "anthropic-messages" : "openai-responses",
+    reasoning: isClaude,
     input: ["text", "image"],
     cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
     contextWindow: DEFAULT_CONTEXT_WINDOW,
-    maxTokens: DEFAULT_MAX_TOKENS,
+    maxTokens: isClaude ? 32_000 : DEFAULT_MAX_TOKENS,
+    headers: COPILOT_HEADERS,
   };
 }

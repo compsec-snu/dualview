@@ -1,0 +1,11 @@
+#!/bin/sh
+set -eu
+input=$(cat)
+if output=$(printf '%s' "$input" |
+  "${CLAUDE_PLUGIN_ROOT}/node_modules/.bin/tsx" \
+    "${CLAUDE_PLUGIN_ROOT}/src/hook.ts"); then
+  printf '%s' "$output"
+  exit 0
+fi
+printf '%s\n' "DualView hook failed to start or complete" >&2
+exit 2

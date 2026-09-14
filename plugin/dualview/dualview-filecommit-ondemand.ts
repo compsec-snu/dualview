@@ -8,9 +8,33 @@
  * canonical DualView workspaces under ~/.dualview/workspaces/<workspace-id>/.
  */
 
-import { readFileSync, writeFileSync, existsSync, copyFileSync, mkdirSync, rmdirSync, statSync, readdirSync } from "fs";
+import {
+  chmodSync,
+  existsSync,
+  linkSync,
+  lstatSync,
+  mkdirSync,
+  readdirSync,
+  renameSync,
+  rmSync,
+  rmdirSync,
+  statSync,
+  symlinkSync,
+  writeFileSync,
+} from "fs";
 import { join, dirname } from "path";
-import { gitExecSync } from "./dualview-git.js";
+import {
+  gitExecSync,
+  gitExecSyncOrThrow,
+  fileSnapshotsEqual,
+  readGitIndexSnapshot,
+  readFilesystemSnapshot,
+  readWorktreeSnapshot,
+  stageFileSnapshots,
+  writeFilesystemSnapshot,
+  writeConflictLog,
+  type GitFileSnapshot,
+} from "./dualview-git.js";
 import {
   getTrackedRoots,
   dualviewGitOpts,
@@ -20,6 +44,7 @@ import {
   loadSymbolMap,
   resolveAllSymbols,
   hasSymbols,
+  type SymbolMap,
 } from "./dualview-symbol-table.js";
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -34,9 +59,19 @@ interface Logger {
 
 interface OnDemandFileCommitOptions {
   dbPath?: string;
+  /** Caller-owned symbols, including in-memory-only policy_file allocations. */
+  symbolMap?: SymbolMap;
   log?: Logger;
+  /** Restrict commit scanning to selected roots. Defaults to the global registry. */
+  roots?: () => Iterable<TrackedRoot>;
+  /** Restrict each selected root to paths within the configured workspace scope. */
+  pathFilter?: (root: TrackedRoot, filePath: string) => boolean;
+  /** Human paths intentionally staged by an adapter as part of the same write. */
+  allowedHumanChanges?: readonly string[];
   // eslint-disable-next-line @typescript-eslint/no-explicit-any -- matches existing auditWrite pattern in dualview-filecommit-worktree.ts
   auditWrite?: (entry: any) => void;
+  /** Propagate synchronization failures for adapters that require fail-closed writes. */
+  throwOnError?: boolean;
 }
 
 interface FileCommitEvent {
@@ -94,17 +129,16 @@ function releaseLockOd(root: TrackedRoot): void {
 // ─────────────────────────────────────────────────────────────────────────────
 
 function getChangedFilesOd(root: TrackedRoot, worktree: string): { status: string; path: string }[] {
-  const { stdout } = gitExecSync(["status", "--porcelain"], dualviewGitOpts(root, worktree));
+  const { stdout } = gitExecSyncOrThrow(
+    ["status", "--porcelain"],
+    dualviewGitOpts(root, worktree),
+    `reading worktree status for ${worktree}`,
+  );
   if (!stdout.trim()) return [];
   return stdout.trim().split("\n").map((line) => ({
     status: line.slice(0, 2).trim(),
     path: line[2] === " " ? line.slice(3) : line.slice(2),
   }));
-}
-
-function stageFilesOd(root: TrackedRoot, worktree: string, filePaths: string[]): void {
-  if (filePaths.length === 0) return;
-  gitExecSync(["add", "--", ...filePaths], dualviewGitOpts(root, worktree));
 }
 
 function collectFilePathsUnder(dirPath: string, relPath: string): string[] {
@@ -127,12 +161,15 @@ function expandTrustedChangedPaths(root: TrackedRoot, filePaths: string[]): stri
   for (const filePath of filePaths) {
     const cleanPath = filePath.replace(/\/+$/, "");
     const trustedFilePath = join(root.trustedPath, cleanPath);
-    if (!existsSync(trustedFilePath)) {
+    let stat: ReturnType<typeof lstatSync>;
+    try {
+      stat = lstatSync(trustedFilePath);
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
       expanded.add(cleanPath);
       continue;
     }
 
-    const stat = statSync(trustedFilePath);
     if (stat.isDirectory()) {
       for (const nested of collectFilePathsUnder(trustedFilePath, cleanPath)) {
         expanded.add(nested);
@@ -144,12 +181,137 @@ function expandTrustedChangedPaths(root: TrackedRoot, filePaths: string[]): stri
   return [...expanded].sort();
 }
 
+let snapshotInstallCounter = 0;
+
+function pathExists(targetPath: string): boolean {
+  try {
+    lstatSync(targetPath);
+    return true;
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") return false;
+    throw err;
+  }
+}
+
+function worktreeSnapshot(rootPath: string, filePath: string): GitFileSnapshot {
+  return readWorktreeSnapshot(rootPath, filePath);
+}
+
+function installSnapshotIfUnchanged(
+  targetPath: string,
+  expected: GitFileSnapshot,
+  desired: GitFileSnapshot,
+): boolean {
+  const token = `${process.pid}-${++snapshotInstallCounter}`;
+  const backupPath = `${targetPath}.dualview-backup-${token}`;
+  const temporaryPath = `${targetPath}.dualview-install-${token}`;
+  let movedOriginal = false;
+
+  const discardOrRestoreBackup = () => {
+    if (!movedOriginal || !pathExists(backupPath)) return;
+    if (pathExists(targetPath)) {
+      rmSync(backupPath, { recursive: true, force: true });
+    } else {
+      renameSync(backupPath, targetPath);
+    }
+    movedOriginal = false;
+  };
+
+  try {
+    try {
+      renameSync(targetPath, backupPath);
+      movedOriginal = true;
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
+    }
+
+    const movedSnapshot = movedOriginal
+      ? readFilesystemSnapshot(backupPath, expected.path)
+      : { path: expected.path, content: null };
+    if (!fileSnapshotsEqual(movedSnapshot, expected)) {
+      discardOrRestoreBackup();
+      return false;
+    }
+
+    if (pathExists(targetPath)) {
+      discardOrRestoreBackup();
+      return false;
+    }
+
+    if (desired.content !== null) {
+      const parentDir = dirname(targetPath);
+      if (!existsSync(parentDir)) mkdirSync(parentDir, { recursive: true });
+      try {
+        if (desired.mode === "120000") {
+          symlinkSync(desired.content.toString(), targetPath);
+        } else {
+          const mode = desired.mode === "100755" ? 0o755 : 0o644;
+          writeFileSync(temporaryPath, desired.content, { mode });
+          chmodSync(temporaryPath, mode);
+          linkSync(temporaryPath, targetPath);
+        }
+      } catch (err: unknown) {
+        if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
+        discardOrRestoreBackup();
+        return false;
+      } finally {
+        rmSync(temporaryPath, { recursive: true, force: true });
+      }
+    }
+
+    if (movedOriginal) {
+      rmSync(backupPath, { recursive: true, force: true });
+      movedOriginal = false;
+    }
+    return true;
+  } catch (err) {
+    rmSync(temporaryPath, { recursive: true, force: true });
+    discardOrRestoreBackup();
+    throw err;
+  }
+}
+
+function restoreTrustedPaths(root: TrackedRoot, filePaths: readonly string[]): void {
+  for (const filePath of filePaths) {
+    const tracked = gitExecSyncOrThrow(
+      ["ls-tree", "-r", "--name-only", "HEAD", "--", filePath],
+      dualviewGitOpts(root, root.trustedPath),
+      `checking trusted HEAD for ${filePath}`,
+    ).stdout.trim();
+    if (tracked) {
+      gitExecSyncOrThrow(
+        ["restore", "--source=HEAD", "--worktree", "--", filePath],
+        dualviewGitOpts(root, root.trustedPath),
+        `restoring trusted path ${filePath}`,
+      );
+      continue;
+    }
+    rmSync(join(root.trustedPath, filePath), { recursive: true, force: true });
+  }
+}
+
 function commitOd(root: TrackedRoot, worktree: string, opts: CommitOpts): void {
   const tag = opts.trusted ? "[DUALVIEW-TRUSTED]" : "[DUALVIEW-UNTRUSTED]";
   const filesMeta = opts.files?.length ? ` files=${opts.files.join(",")}` : "";
   const msg = `${tag} dualview: tool=${opts.toolName || "unknown"} callId=${opts.callId || "none"} run=${opts.runId || "none"}${filesMeta}`;
   const flags = opts.trusted ? [] : ["--no-verify"];
-  gitExecSync(["commit", "-m", msg, "--allow-empty", ...flags], dualviewGitOpts(root, worktree));
+  gitExecSyncOrThrow(
+    ["commit", "-m", msg, "--allow-empty", ...flags],
+    dualviewGitOpts(root, worktree),
+    `${tag} commit`,
+  );
+}
+
+function latestCommitSubjectForPath(
+  root: TrackedRoot,
+  commit: string,
+  filePath: string,
+): string {
+  return gitExecSyncOrThrow(
+    ["log", "-1", "--format=%s", commit, "--", filePath],
+    dualviewGitOpts(root),
+    `reading latest commit for ${filePath}`,
+  ).stdout.trim();
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -163,19 +325,29 @@ function commitOd(root: TrackedRoot, worktree: string, opts: CommitOpts): void {
  * worktree has uncommitted changes, performs the dual-branch commit:
  *
  *   1. Commit [DUALVIEW-TRUSTED] on dualview-trusted branch (trusted worktree)
- *   2. Sync this tool call's changed files to main worktree (real filesystem)
+ *   2. Resolve and install Human-facing snapshots without overwriting Human edits
  *   3. Commit [DUALVIEW-TRUSTED] on master (blame-visible trusted parent)
- *   4. De-symbolize in main worktree
- *   5. Commit [DUALVIEW-UNTRUSTED] on master (raw content)
+ *   4. Commit [DUALVIEW-UNTRUSTED] on master (Human-facing content)
  */
-export function createOnDemandFileCommitHandler({ dbPath, log, auditWrite }: OnDemandFileCommitOptions) {
+export function createOnDemandFileCommitHandler({
+  dbPath,
+  symbolMap: externalSymbolMap,
+  log,
+  roots,
+  pathFilter,
+  allowedHumanChanges,
+  auditWrite,
+  throwOnError,
+}: OnDemandFileCommitOptions) {
+  const allowedHumanPaths = new Set(allowedHumanChanges ?? []);
   return async (event: FileCommitEvent, _ctx: unknown): Promise<void> => {
     if (log) log.info(`[DualView-filecommit-od] after_tool_call FIRED: tool=${event?.toolName}`);
 
-    for (const [_workTree, root] of getTrackedRoots()) {
+    for (const root of roots?.() ?? getTrackedRoots().values()) {
       try {
         // 1. Detect changes in the trusted worktree
-        const changed = getChangedFilesOd(root, root.trustedPath);
+        const changed = getChangedFilesOd(root, root.trustedPath)
+          .filter((file) => !pathFilter || pathFilter(root, file.path));
         if (changed.length === 0) continue;
 
         if (log) log.info(`[DualView-filecommit-od] ${root.workTree}: ${changed.length} changed file(s) in trusted worktree`);
@@ -183,92 +355,326 @@ export function createOnDemandFileCommitHandler({ dbPath, log, auditWrite }: OnD
         acquireLockOd(root);
         try {
           const filePaths = changed.map((f) => f.path);
-
-          // 2. Commit trusted snapshot on the dualview-trusted branch
-          stageFilesOd(root, root.trustedPath, filePaths);
-          commitOd(root, root.trustedPath, {
-            trusted: true,
-            toolName: event.toolName,
-            callId: event.toolCallId,
-            runId: event.runId,
-            files: filePaths,
-          });
-          const { stdout: trustedHeadOut } = gitExecSync(
-            ["rev-parse", "HEAD"],
-            dualviewGitOpts(root, root.trustedPath),
-          );
-          const trustedBranchHead = trustedHeadOut.trim();
-          if (log) {
-            log.info(`[DualView-filecommit-od] Committed ${filePaths.length} file(s) as [DUALVIEW-TRUSTED] on dualview-trusted: ${trustedBranchHead}`);
-          }
-
-          // 3. Sync only paths dirtied by this tool call to main. Do not diff
+          // Sync only paths dirtied by this tool call to main. Do not diff
           // against master: trusted and main intentionally differ for policy
           // files, and those representation differences are not current writes.
           const syncedPaths = expandTrustedChangedPaths(root, filePaths);
-
+          const trustedSnapshots = new Map(
+            syncedPaths.map((filePath) => [
+              filePath,
+              worktreeSnapshot(root.trustedPath, filePath),
+            ]),
+          );
+          const persistedSymbols = loadSymbolMap(dbPath);
+          const symbolMap: SymbolMap = {
+            symbols: new Map([
+              ...(externalSymbolMap?.symbols ?? []),
+              ...persistedSymbols.symbols,
+            ]),
+          };
+          const humanSnapshots = new Map(
+            [...trustedSnapshots].map(([filePath, snapshot]) => {
+              if (snapshot.content === null
+                || snapshot.mode === "120000"
+                || snapshot.content.subarray(0, 8192).includes(0)) {
+                return [filePath, snapshot];
+              }
+              const text = snapshot.content.toString("utf8");
+              return [
+                filePath,
+                {
+                  ...snapshot,
+                  content: Buffer.from(
+                    hasSymbols(text) && symbolMap.symbols.size > 0
+                      ? resolveAllSymbols(text, symbolMap)
+                      : text,
+                  ),
+                },
+              ];
+            }),
+          );
+          const mainHead = gitExecSyncOrThrow(
+            ["rev-parse", "HEAD"],
+            dualviewGitOpts(root),
+            "reading main branch HEAD",
+          ).stdout.trim();
+          const trustedHead = gitExecSyncOrThrow(
+            ["rev-parse", "HEAD"],
+            dualviewGitOpts(root, root.trustedPath),
+            "reading trusted branch HEAD",
+          ).stdout.trim();
+          const supersededHumanPaths = syncedPaths.filter((filePath) => {
+            if (trustedSnapshots.size !== 1) return false;
+            const snapshot = trustedSnapshots.get(filePath);
+            return snapshot?.content === null
+              && latestCommitSubjectForPath(root, mainHead, filePath)
+                .startsWith("[DUALVIEW-HUMAN]");
+          });
+          const mainDirty = new Set<string>();
+          for (const file of getChangedFilesOd(root, root.workTree)) {
+            mainDirty.add(file.path);
+          }
+          let safeSyncedPaths: string[] = [];
+          const skippedPaths: string[] = [];
+          const skippedReasons = new Map<string, string>();
+          const skipForRace = (filePath: string, reason: string) => {
+            skippedPaths.push(filePath);
+            skippedReasons.set(filePath, reason);
+            if (log) {
+              log.warn(`[DualView-filecommit-od] R2 race: skipping ${filePath} (${reason})`);
+            }
+          };
+          const expectedSnapshots = new Map<string, GitFileSnapshot>();
+          const installCandidates: string[] = [];
           for (const filePath of syncedPaths) {
-            const trustedFilePath = join(root.trustedPath, filePath);
-            const mainFilePath = join(root.workTree, filePath);
-
-            if (!existsSync(trustedFilePath)) {
-              gitExecSync(
-                ["rm", "-f", "--ignore-unmatch", "--", filePath],
-                dualviewGitOpts(root),
+            const dirtyAtSync = !allowedHumanPaths.has(filePath)
+              && (
+                mainDirty.has(filePath)
+                || getChangedFilesOd(root, root.workTree).some((file) => file.path === filePath)
               );
+            if (dirtyAtSync) {
+              skipForRace(filePath, "main worktree has uncommitted edits; refusing to overwrite");
               continue;
             }
 
-            const mainDir = dirname(mainFilePath);
-            if (!existsSync(mainDir)) mkdirSync(mainDir, { recursive: true });
-            copyFileSync(trustedFilePath, mainFilePath);
-          }
-
-          // 4. Commit trusted twin on master
-          stageFilesOd(root, root.workTree, syncedPaths);
-          commitOd(root, root.workTree, {
-            trusted: true,
-            toolName: event.toolName,
-            callId: event.toolCallId,
-            runId: event.runId,
-            files: filePaths,
-          });
-          if (log) {
-            log.info(`[DualView-filecommit-od] Committed ${syncedPaths.length} file(s) as [DUALVIEW-TRUSTED] on master`);
-          }
-
-          // 5. De-symbolize synced files in main worktree
-          const symbolMap = loadSymbolMap(dbPath);
-          for (const filePath of syncedPaths) {
-            const mainFilePath = join(root.workTree, filePath);
-            if (!existsSync(mainFilePath)) continue;
-
-            const content = readFileSync(mainFilePath);
-            const sample = content.subarray(0, 8192);
-            if (sample.includes(0)) continue;
-
-            const text = content.toString("utf8");
-            if (hasSymbols(text) && symbolMap.symbols.size > 0) {
-              const resolved = resolveAllSymbols(text, symbolMap);
-              writeFileSync(mainFilePath, resolved);
+            const dirtyAfterRescan = !allowedHumanPaths.has(filePath)
+              && getChangedFilesOd(root, root.workTree)
+                .some((file) => file.path === filePath);
+            if (dirtyAfterRescan) {
+              skipForRace(filePath, "main worktree changed after per-path rescan");
+              continue;
             }
+
+            expectedSnapshots.set(
+              filePath,
+              readGitIndexSnapshot(filePath, dualviewGitOpts(root)),
+            );
+            installCandidates.push(filePath);
           }
 
-          // 6. Commit untrusted version on master
-          const mainChanged = getChangedFilesOd(root, root.workTree);
-          if (mainChanged.length > 0) {
-            stageFilesOd(root, root.workTree, syncedPaths);
-          }
-          commitOd(root, root.workTree, {
-            trusted: false,
-            toolName: event.toolName,
-            callId: event.toolCallId,
-            runId: event.runId,
-            files: filePaths,
-          });
+          const installedPaths: string[] = [];
+          try {
+            for (const filePath of installCandidates) {
+              const mainFilePath = join(root.workTree, filePath);
+              const desired = humanSnapshots.get(filePath)!;
+              const expected = expectedSnapshots.get(filePath)!;
+              const installed = installSnapshotIfUnchanged(mainFilePath, expected, desired);
+              if (!installed) {
+                skipForRace(filePath, "main worktree changed while applying Agent file changes");
+                continue;
+              }
+              installedPaths.push(filePath);
+            }
+            safeSyncedPaths = [...installedPaths];
 
-          if (log) {
-            log.info(`[DualView-filecommit-od] Committed ${syncedPaths.length} file(s) as [DUALVIEW-UNTRUSTED] on master`);
+            safeSyncedPaths = safeSyncedPaths.filter((filePath) => {
+              const desired = humanSnapshots.get(filePath)!;
+              const current = worktreeSnapshot(root.workTree, filePath);
+              const unchanged = fileSnapshotsEqual(desired, current);
+              if (!unchanged) {
+                skipForRace(filePath, "main worktree changed after copy/remove");
+              }
+              return unchanged;
+            });
+          } catch (err) {
+            const rollbackErrors: string[] = [];
+            for (const filePath of [...installedPaths].reverse()) {
+              try {
+                installSnapshotIfUnchanged(
+                  join(root.workTree, filePath),
+                  humanSnapshots.get(filePath)!,
+                  expectedSnapshots.get(filePath)!,
+                );
+              } catch (rollbackErr) {
+                rollbackErrors.push(`${filePath}: ${(rollbackErr as Error).message}`);
+              }
+            }
+            if (rollbackErrors.length > 0) {
+              throw new Error(
+                `${(err as Error).message}; install rollback failed: ${rollbackErrors.join("; ")}`,
+              );
+            }
+            throw err;
+          }
+
+          const safeSet = new Set(safeSyncedPaths);
+          const skippedSyncedPaths = syncedPaths.filter((filePath) => !safeSet.has(filePath));
+          let trustedBranchHead = trustedHead;
+          try {
+            gitExecSyncOrThrow(
+              ["reset", "--mixed", "--quiet", "HEAD"],
+              dualviewGitOpts(root, root.trustedPath),
+              "resetting trusted shadow index",
+            );
+            stageFileSnapshots(
+              [...trustedSnapshots.values()],
+              dualviewGitOpts(root, root.trustedPath),
+            );
+            commitOd(root, root.trustedPath, {
+              trusted: true,
+              toolName: event.toolName,
+              callId: event.toolCallId,
+              runId: event.runId,
+              files: syncedPaths,
+            });
+            trustedBranchHead = gitExecSyncOrThrow(
+              ["rev-parse", "HEAD"],
+              dualviewGitOpts(root, root.trustedPath),
+              "reading committed trusted branch HEAD",
+            ).stdout.trim();
+            if (log) {
+              log.info(
+                `[DualView-filecommit-od] Committed ${syncedPaths.length} file(s) as [DUALVIEW-TRUSTED] on dualview-trusted: ${trustedBranchHead}`,
+              );
+            }
+            const recordSkippedPaths = () => {
+              for (const filePath of skippedSyncedPaths) {
+                writeConflictLog(root.workTree, {
+                  race: "R2",
+                  source: "createOnDemandFileCommitHandler",
+                  target: filePath,
+                  reason: skippedReasons.get(filePath) ?? "concurrent Human file operation",
+                  extra: {
+                    toolName: event.toolName,
+                    toolCallId: event.toolCallId,
+                    runId: event.runId,
+                    trustedBranchHead,
+                  },
+                });
+              }
+            };
+            const recordSupersededHumanPaths = () => {
+              for (const filePath of supersededHumanPaths) {
+                writeConflictLog(root.workTree, {
+                  race: "R2",
+                  source: "createOnDemandFileCommitHandler",
+                  target: filePath,
+                  reason: "Agent deletion superseded a reconciled Human file operation",
+                  extra: {
+                    toolName: event.toolName,
+                    toolCallId: event.toolCallId,
+                    runId: event.runId,
+                    outcome: "human-operation-superseded",
+                    trustedBranchHead,
+                  },
+                });
+              }
+            };
+            restoreTrustedPaths(root, skippedSyncedPaths);
+
+            if (safeSyncedPaths.length === 0) {
+              if (log) {
+                log.warn(
+                  `[DualView-filecommit-od] All ${syncedPaths.length} path(s) skipped due to R2 race`,
+                );
+              }
+              recordSkippedPaths();
+              recordSupersededHumanPaths();
+              if (auditWrite) {
+                auditWrite({
+                  hook: "file_commit_ondemand",
+                  toolName: event.toolName,
+                  toolCallId: event.toolCallId,
+                  runId: event.runId,
+                  workTree: root.workTree,
+                  trustedFiles: filePaths,
+                  syncedFiles: [],
+                  skippedDirtyFiles: skippedPaths,
+                  trustedBranchHead,
+                });
+              }
+              if (throwOnError) {
+                throw new Error(
+                  `DualView refused to overwrite ${skippedPaths.length} Human File System path(s)`,
+                );
+              }
+              continue;
+            }
+
+            // Commit the Agent snapshot only for paths that reached the Human
+            // File System without overwriting a concurrent Human operation.
+            const safeTrustedSnapshots = safeSyncedPaths.map(
+              (filePath) => trustedSnapshots.get(filePath)!,
+            );
+            const safeHumanSnapshots = safeSyncedPaths.map(
+              (filePath) => humanSnapshots.get(filePath)!,
+            );
+
+            gitExecSyncOrThrow(
+              ["reset", "--mixed", "--quiet", "HEAD"],
+              dualviewGitOpts(root),
+              "resetting main shadow index",
+            );
+            stageFileSnapshots(safeTrustedSnapshots, dualviewGitOpts(root));
+            commitOd(root, root.workTree, {
+              trusted: true,
+              toolName: event.toolName,
+              callId: event.toolCallId,
+              runId: event.runId,
+              files: safeSyncedPaths,
+            });
+            if (log) {
+              log.info(`[DualView-filecommit-od] Committed ${safeSyncedPaths.length} file(s) as [DUALVIEW-TRUSTED] on master`);
+            }
+
+            stageFileSnapshots(safeHumanSnapshots, dualviewGitOpts(root));
+            commitOd(root, root.workTree, {
+              trusted: false,
+              toolName: event.toolName,
+              callId: event.toolCallId,
+              runId: event.runId,
+              files: safeSyncedPaths,
+            });
+
+            if (log) {
+              log.info(`[DualView-filecommit-od] Committed ${safeSyncedPaths.length} file(s) as [DUALVIEW-UNTRUSTED] on master`);
+            }
+            recordSkippedPaths();
+            recordSupersededHumanPaths();
+          } catch (err) {
+            const rollbackErrors: string[] = [];
+            const rollback = (label: string, action: () => void) => {
+              try {
+                action();
+              } catch (rollbackErr) {
+                rollbackErrors.push(`${label}: ${(rollbackErr as Error).message}`);
+              }
+            };
+
+            rollback("main branch", () => {
+              gitExecSyncOrThrow(
+                ["reset", "--mixed", "--quiet", mainHead],
+                dualviewGitOpts(root),
+                "rolling back main branch",
+              );
+              for (const filePath of [...installedPaths].reverse()) {
+                installSnapshotIfUnchanged(
+                  join(root.workTree, filePath),
+                  humanSnapshots.get(filePath)!,
+                  expectedSnapshots.get(filePath)!,
+                );
+              }
+            });
+            rollback("trusted branch", () => {
+              gitExecSyncOrThrow(
+                ["reset", "--mixed", "--quiet", trustedHead],
+                dualviewGitOpts(root, root.trustedPath),
+                "rolling back trusted branch",
+              );
+              for (const snapshot of trustedSnapshots.values()) {
+                writeFilesystemSnapshot(
+                  join(root.trustedPath, snapshot.path),
+                  snapshot,
+                );
+              }
+            });
+
+            if (rollbackErrors.length > 0) {
+              throw new Error(
+                `${(err as Error).message}; File commit rollback failed: ${rollbackErrors.join("; ")}`,
+              );
+            }
+            throw err;
           }
 
           if (auditWrite) {
@@ -279,7 +685,8 @@ export function createOnDemandFileCommitHandler({ dbPath, log, auditWrite }: OnD
               runId: event.runId,
               workTree: root.workTree,
               trustedFiles: filePaths,
-              syncedFiles: syncedPaths,
+              syncedFiles: safeSyncedPaths,
+              skippedDirtyFiles: skippedPaths,
               trustedBranchHead,
             });
           }
@@ -290,6 +697,7 @@ export function createOnDemandFileCommitHandler({ dbPath, log, auditWrite }: OnD
         if (log) {
           log.warn(`[DualView-filecommit-od] Error for ${root.workTree}: ${(err as Error).message}`);
         }
+        if (throwOnError) throw err;
       }
     }
   };

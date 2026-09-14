@@ -210,6 +210,11 @@ FORWARD_KEYS=(
   ANTHROPIC_API_KEY
   OPENAI_API_KEY
   GEMINI_API_KEY
+  OPENROUTER_API_KEY
+  OPENROUTER_MODEL
+  FOUNDRY_ENDPOINT
+  FOUNDRY_KEY
+  FOUNDRY_MODEL
   BRAVE_API_KEY
   OPENAI_CODEX_ACCESS
   OPENAI_CODEX_REFRESH
@@ -391,10 +396,14 @@ elif [ -f "$AUTH_SRC" ]; then
 elif [ -f "$BOT_STATE_DIR/agents/main/agent/auth-profiles.json" ]; then
   rm -f "$_AUTH_TMP"
   echo "Auth:       reusing existing (main + ullm)"
+elif [ -n "${FOUNDRY_ENDPOINT:-}" ] && [ -n "${FOUNDRY_KEY:-}" ]; then
+  rm -f "$_AUTH_TMP"
+  echo "Auth:       Microsoft Foundry key from environment"
 else
   rm -f "$_AUTH_TMP"
   echo "ERROR: No LLM credentials found."
   echo "  Provide one of: ANTHROPIC_API_KEY / OPENAI_API_KEY / GEMINI_API_KEY,"
+  echo "  FOUNDRY_ENDPOINT + FOUNDRY_KEY,"
   echo "  or OPENAI_CODEX_ACCESS + OPENAI_CODEX_REFRESH (+ OPENAI_CODEX_ACCOUNT_ID),"
   echo "  or ~/.codex/auth.json, or --anthropic-key flag."
   exit 1

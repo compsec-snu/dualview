@@ -411,6 +411,15 @@ export class DataTrustPolicyRuntimeManager {
     return this.engine;
   }
 
+  /**
+   * Reapply this manager's snapshot to the canonical module policy tables.
+   * Framework adapters with multiple manager instances call this immediately
+   * before synchronous policy lookup to prevent cross-instance drift.
+   */
+  activate(): void {
+    this.reapply(false);
+  }
+
   getEffectivePolicyFile(): PolicyFileConfig | null {
     return clonePolicyFile(this.effectivePolicyFile);
   }
@@ -420,6 +429,7 @@ export class DataTrustPolicyRuntimeManager {
   }
 
   list(): DataTrustPolicyList {
+    this.activate();
     const inboundTools = Object.keys(TOOL_INBOUND_SPEC).sort();
     const outboundTools = Array.from(new Set([
       ...Object.keys(TOOL_INPUT_RESOLVE),

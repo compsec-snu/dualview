@@ -95,7 +95,12 @@ function expandTrustedChangedPaths(trustedPath: string, filePaths: string[]): st
  * [DUALVIEW-UNTRUSTED] commit. This preserves plain git-blame ancestry on master
  * while keeping the trusted worktree on a trusted-only lineage.
  */
-export function createWorktreeFileCommitHandler({ gitRoot, dbPath, log, auditWrite }: WorktreeFileCommitOptions) {
+export function createWorktreeFileCommitHandler({
+  gitRoot,
+  dbPath,
+  log,
+  auditWrite,
+}: WorktreeFileCommitOptions) {
   const trustedPath = getWorktreePath(gitRoot);
 
   return async (event: FileCommitEvent, _ctx: unknown): Promise<void> => {
@@ -151,18 +156,24 @@ export function createWorktreeFileCommitHandler({ gitRoot, dbPath, log, auditWri
         // absorbs it into the trusted branch.
         const mainDirty = new Set<string>();
         for (const f of getChangedFiles(gitRoot)) mainDirty.add(f.path);
-
         const safeSyncedPaths: string[] = [];
         const skippedPaths: string[] = [];
         for (const filePath of syncedPaths) {
-          if (mainDirty.has(filePath)) {
+          const dirtyAtSync = mainDirty.has(filePath)
+            || getChangedFiles(gitRoot).some((f) => f.path === filePath);
+          if (dirtyAtSync) {
             skippedPaths.push(filePath);
             writeConflictLog(gitRoot, {
               race: "R2",
               source: "createWorktreeFileCommitHandler",
               target: filePath,
               reason: "main worktree has uncommitted edits; refusing to overwrite",
-              extra: { toolName: event.toolName, toolCallId: event.toolCallId, runId: event.runId },
+              extra: {
+                toolName: event.toolName,
+                toolCallId: event.toolCallId,
+                runId: event.runId,
+                trustedBranchHead,
+              },
             });
             if (log) {
               log.warn(`[DualView-filecommit-wt] R2 race: skipping ${filePath} (main worktree dirty)`);
@@ -192,6 +203,19 @@ export function createWorktreeFileCommitHandler({ gitRoot, dbPath, log, auditWri
               `[DualView-filecommit-wt] All ${syncedPaths.length} path(s) skipped due to R2 race; trusted branch moved but master untouched`,
             );
           }
+          if (auditWrite) {
+            auditWrite({
+              hook: "file_commit_worktree",
+              toolName: event.toolName,
+              toolCallId: event.toolCallId,
+              runId: event.runId,
+              trustedFiles: filePaths,
+              syncedFiles: [],
+              skippedDirtyFiles: skippedPaths,
+              trustedBranchHead,
+              untrustedFiles: [],
+            });
+          }
           return;
         }
 
@@ -203,7 +227,7 @@ export function createWorktreeFileCommitHandler({ gitRoot, dbPath, log, auditWri
           toolName: event.toolName,
           callId: event.toolCallId,
           runId: event.runId,
-          files: filePaths,
+          files: safeSyncedPaths,
         });
         if (log) {
           log.info(`[DualView-filecommit-wt] Committed ${safeSyncedPaths.length} file(s) as [DUALVIEW-TRUSTED] on master`);
@@ -241,7 +265,7 @@ export function createWorktreeFileCommitHandler({ gitRoot, dbPath, log, auditWri
           toolName: event.toolName,
           callId: event.toolCallId,
           runId: event.runId,
-          files: filePaths,
+          files: safeSyncedPaths,
         });
 
         if (log) {

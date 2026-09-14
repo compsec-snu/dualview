@@ -18,6 +18,7 @@ const S = {
   auditWsFilter: 'all',
   logWsFilter: 'all',
   logData: {},
+  concurrencyData: {},
   _assertionSpecs: {},    // testId -> parsed YAML assertions array
   _currentAssertions: [],  // assertion results for the current workspace
   dualviewCommitsData: {},

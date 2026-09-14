@@ -1,0 +1,22 @@
+{
+  "name": "@dualview/claude-code",
+  "version": "0.2.0",
+  "description": "Claude Code plugin adapter for DualView",
+  "license": "BUSL-1.1",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "typecheck": "tsc -p tsconfig.json"
+  },
+  "dependencies": {
+    "@anthropic-ai/sandbox-runtime": "^0.0.73",
+    "@modelcontextprotocol/sdk": "^1.25.3",
+    "dualview": "file:../dualview",
+    "tsx": "^4.20.0",
+    "zod": "^4.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^25.0.0",
+    "typescript": "^5.9.3"
+  }
+}

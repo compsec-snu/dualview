@@ -110,7 +110,7 @@ function botAddSymbolUsage(map, sym, node) {
 function botAuditUsageDescriptor(ev) {
   const hook = String(ev?.hookType || '');
   const tool = displayBotToolName(ev?.toolName);
-  if (hook === 'message_sending') return { role: 'Response', label: 'Assistant response' };
+  if (hook === 'message_sending') return { role: 'Response', label: 'AI response' };
   if (hook.includes('tool_call')) return { role: 'Tool arg', label: tool };
   if (hook.includes('tool_result') || hook === 'inspect_symbol') return { role: 'Tool result', label: tool };
   return null;
@@ -182,7 +182,7 @@ function buildBotSymbolUsage(conv, events = []) {
         for (const sym of botSymbolsInText(value)) {
           botAddSymbolUsage(usage, sym, {
             role: 'Response',
-            label: 'Assistant response',
+            label: 'AI response',
             value: botTrimText(value),
             ts,
           });
@@ -308,6 +308,107 @@ export function switchLogWs(wsId) {
   }
 }
 
+function renderConcurrencyTimeline(timeline) {
+  const events = Array.isArray(timeline) ? timeline : timeline?.events;
+  if (!Array.isArray(events) || events.length === 0) return '';
+
+  const phaseDetails = {
+    'human-edit.after-changed-scan': 'DualView applies Human file changes to Agent files after the changed-file scan',
+    'human-edit.before-hash-recheck': 'DualView applies Human file changes to Agent files before the hash recheck',
+    'human-edit.after-hash-recheck': 'DualView applies Human file changes to Agent files after the hash recheck',
+    'filecommit.after-main-dirty-scan': 'DualView applies Agent file changes to Human files after the dirty-path scan',
+    'filecommit.after-per-path-rescan': 'DualView applies Agent file changes to Human files after the per-path rescan',
+    'filecommit.after-copy-remove': 'DualView applies Agent file changes to Human files after copy or remove',
+  };
+  const toolCallsById = new Map(
+    events
+      .filter(event => event.event === 'Tool call' && event.toolCallId)
+      .map(event => [event.toolCallId, { toolName: event.toolName, target: event.detail }]),
+  );
+
+  const eventRole = event => {
+    if (event.event === 'plugin paused' || event.event === 'plugin resumed') return 'dualview';
+    return event.lane;
+  };
+  const eventLabel = event => {
+    if (eventRole(event) === 'human') {
+      if (['rename', 'move'].includes(event.event)) return 'File name change';
+      if (event.event === 'delete') return 'File deletion';
+      if (['write', 'append', 'replace', 'atomic replace'].includes(event.event)) return 'File write';
+    }
+    if (event.event === 'file_commit_worktree' || event.event === 'file_commit_ondemand') return 'File commit';
+    return event.event.replaceAll('_', ' ');
+  };
+  const toolCallLabel = (toolName, toolCallId, target = '') => {
+    const linked = toolCallId ? toolCallsById.get(toolCallId) : null;
+    const name = toolName && toolName !== 'unknown' ? toolName : linked?.toolName;
+    const file = linked?.target || target;
+    if (!name || name === 'unknown') return '';
+    return file ? `${name}(file_path="${file}")` : `${name}()`;
+  };
+
+  let html = `<section class="concurrency-timeline">
+    <div class="concurrency-timeline-title">
+      <strong>Concurrency timeline</strong>
+      <span>Order determines correctness.</span>
+    </div>
+    <div class="concurrency-timeline-grid concurrency-timeline-head">
+      <span>Order</span><span>Agent</span><span>DualView</span><span>Human</span>
+    </div>`;
+
+  let activePhase = '';
+  for (const event of events) {
+    const role = eventRole(event);
+    if (event.event === 'plugin paused') activePhase = event.detail || '';
+    const phaseDetail = phaseDetails[event.detail] || '';
+    const eventToolCall = toolCallLabel(
+      event.toolName,
+      event.toolCallId,
+      event.event === 'Tool call' ? event.detail : '',
+    );
+    const activeTool = role === 'human' && event.activeToolName
+      ? toolCallLabel(event.activeToolName, event.activeToolCallId)
+      : '';
+    const humanPhase = role === 'human' && activePhase
+      ? `During: ${phaseDetails[activePhase] || activePhase}`
+      : '';
+    const humanFileDetails = role !== 'human'
+      ? []
+      : ['rename', 'move'].includes(event.event)
+        ? [
+            event.from ? `From: ${event.from}` : '',
+            event.to ? `To: ${event.to}` : '',
+          ]
+        : [event.detail ? `File: ${event.detail}` : ''];
+    const detailLines = [
+      phaseDetail,
+      eventToolCall,
+      Array.isArray(event.files) && event.files.length > 0 ? `Files: ${event.files.join(', ')}` : '',
+      Array.isArray(event.syncedFiles) && event.syncedFiles.length > 0 ? `Synced: ${event.syncedFiles.join(', ')}` : '',
+      Array.isArray(event.skippedDirtyFiles) && event.skippedDirtyFiles.length > 0 ? `Conflict: ${event.skippedDirtyFiles.join(', ')}` : '',
+      event.trustedBranchHead ? `Agent commit: ${event.trustedBranchHead.slice(0, 8)}` : '',
+      event.isError === true ? 'Error' : '',
+      ...humanFileDetails,
+      humanPhase,
+      activeTool ? `Tool call: ${activeTool}` : '',
+    ].filter(Boolean);
+    const detail = detailLines.length > 0
+      ? `<span class="concurrency-event-detail">${detailLines.map(line => `<span>${esc(line)}</span>`).join('')}</span>`
+      : '';
+    const eventCard = `<span class="concurrency-event role-${esc(role)}">
+      <strong>${esc(eventLabel(event))}</strong>${detail}
+    </span>`;
+    html += `<div class="concurrency-timeline-grid">
+      <span class="concurrency-order"><strong>#${String(event.order).padStart(2, '0')}</strong><small>+${esc(event.elapsedMs)}ms</small></span>
+      <span>${role === 'agent' ? eventCard : ''}</span>
+      <span>${role === 'dualview' ? eventCard : ''}</span>
+      <span>${role === 'human' ? eventCard : ''}</span>
+    </div>`;
+    if (event.event === 'plugin resumed') activePhase = '';
+  }
+  return html + '</section>';
+}
+
 export async function renderLog(el) {
   // Eval mode: show gateway log as plain text
   if (S.mode === 'eval' && S.currentEvalRunId) {
@@ -323,10 +424,21 @@ export async function renderLog(el) {
   // Fetch per-workspace log when filtering, full session log otherwise
   const wsParam = S.logWsFilter && S.logWsFilter !== 'all' ? `?ws=${S.logWsFilter}` : '';
   const cacheKey = `${S.currentSession.id}:${wsParam}`;
+  const timelineWs = S.logWsFilter && S.logWsFilter !== 'all' ? S.logWsFilter : null;
+  const timelineKey = timelineWs ? `${S.currentSession.id}:${timelineWs}` : null;
+  const requests = [];
   if (!S.logData[cacheKey]) {
-    S.logData[cacheKey] = await api(`sessions/${S.currentSession.id}/log${wsParam}`);
+    requests.push(api(`sessions/${S.currentSession.id}/log${wsParam}`).then(data => { S.logData[cacheKey] = data; }));
   }
+  if (timelineKey && (!S.concurrencyData[timelineKey] || S.currentSession.result === 'RUNNING')) {
+    requests.push(
+      api(`sessions/${S.currentSession.id}/workspace/${timelineWs}/concurrency-timeline`)
+        .then(data => { S.concurrencyData[timelineKey] = data; }),
+    );
+  }
+  await Promise.all(requests);
   const entries = S.logData[cacheKey];
+  const concurrencyEvents = timelineKey ? S.concurrencyData[timelineKey] : [];
 
   const allWsIds = usableWsIds(S.currentSession);
 
@@ -344,6 +456,8 @@ export async function renderLog(el) {
   if (allWsIds.length > 1) {
     html += renderWsSelector(allWsIds, "switchLogWs(this.value)", { includeAll: true, selected: S.logWsFilter });
   }
+
+  html += renderConcurrencyTimeline(concurrencyEvents);
 
   html += `<div class="expand-controls">
     <button class="expand-btn" onclick="toggleAll(this, true)">Expand All</button>

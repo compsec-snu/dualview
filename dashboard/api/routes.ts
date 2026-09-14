@@ -8,6 +8,7 @@ import { json, resolveBotWsDir, parseSessionKey, sessionLabel } from "./utils.js
 import { parseSessionList } from "./sessions.js";
 import { parseLogEntries, parseWsLogEntries } from "./logs.js";
 import { getConversation, getAudit, getNotify, getLlmRequests, getViewRoots, getViewRootsForDir, listWsFiles, listFilesForDir, readWsFile, readFileForDir } from "./workspace.js";
+import { getConcurrencyTimeline } from "./concurrency.js";
 import { getGitLog, getGitLogForDir, getFileGitLog, getFileGitLogForDir, getFileAtCommit, getFileAtCommitForDir, getCommitDetail, getCommitDetailForDir, getAdfiCommitsByCallId, getAdfiCommitsByCallIdForDir } from "./git.js";
 import { parseBotSessionList, getBotConversation, getBotAudit, getBotLlmRequests } from "./bot-sessions.js";
 import { evaluateBotAssertions } from "./bot-assertions.js";
@@ -24,6 +25,7 @@ const SPEC_TREE_BASES = [
   path.join(TEST_DIR, "benchmark"),
   path.join(TEST_DIR, "e2e"),
 ];
+const INTEGRATION_SCENARIOS_DIR = path.join(TEST_DIR, "integration", "scenarios");
 
 function findSpecByPrefix(kind: string, idPrefix: string): { dir: string; file: string } | null {
   for (const base of SPEC_TREE_BASES) {
@@ -62,6 +64,27 @@ function listSpecFiles(kind: string): { dir: string; file: string }[] {
     }
   }
   return out;
+}
+
+function findTestDefinitionByPrefix(testId: string): { dir: string; file: string } | null {
+  const userTask = findSpecByPrefix("user-tasks", testId);
+  if (userTask) return userTask;
+  if (!fs.existsSync(INTEGRATION_SCENARIOS_DIR)) return null;
+  const file = fs.readdirSync(INTEGRATION_SCENARIOS_DIR).find(
+    (name) => name.startsWith(testId + "-") && (name.endsWith(".yaml") || name.endsWith(".yml")),
+  );
+  return file ? { dir: INTEGRATION_SCENARIOS_DIR, file } : null;
+}
+
+function listTestDefinitionFiles(): { dir: string; file: string }[] {
+  const files = listSpecFiles("user-tasks");
+  if (!fs.existsSync(INTEGRATION_SCENARIOS_DIR)) return files;
+  return files.concat(
+    fs.readdirSync(INTEGRATION_SCENARIOS_DIR)
+      .filter((file) => file.endsWith(".yaml") || file.endsWith(".yml"))
+      .sort()
+      .map((file) => ({ dir: INTEGRATION_SCENARIOS_DIR, file })),
+  );
 }
 
 function hasAssertionEntries(entries: LogEntry[] | null | undefined): entries is LogEntry[] {
@@ -159,6 +182,15 @@ export function handleApiRequest(url: string, res: ServerResponse): void {
     else if (field === "notify") json(res, getNotify(sessionId!, wsId!));
     else if (field === "llm-requests") json(res, getLlmRequests(sessionId!, wsId!));
     else json(res, { error: "Unknown field" }, 400);
+    return;
+  }
+
+  const concurrencyTimelineMatch = url.match(/^\/api\/sessions\/([^/]+)\/workspace\/(\d{2}(?:-a\d+)?)\/concurrency-timeline$/);
+  if (concurrencyTimelineMatch) {
+    const [, sessionId, wsId] = concurrencyTimelineMatch;
+    json(res, {
+      events: getConcurrencyTimeline(sessionId!, wsId!),
+    });
     return;
   }
 
@@ -326,7 +358,7 @@ export function handleApiRequest(url: string, res: ServerResponse): void {
     let testActive: true | false | "wip" | null = null;
     if (test) {
       const testId = test.name.split("\u00d7")[0]!;
-      const found = findSpecByPrefix("user-tasks", testId);
+      const found = findTestDefinitionByPrefix(testId);
       if (found) {
         try {
           const specContent = fs.readFileSync(path.join(found.dir, found.file), "utf-8");
@@ -375,13 +407,12 @@ export function handleApiRequest(url: string, res: ServerResponse): void {
   // /api/test-names — map of test IDs to human-readable names from YAML specs
   if (url === "/api/test-names") {
     const names: Record<string, string> = {};
-    for (const { dir, file } of listSpecFiles("user-tasks")) {
-      const m = file.match(/^(UT-\d+)-/);
-      if (!m) continue;
+    for (const { dir, file } of listTestDefinitionFiles()) {
       try {
         const content = fs.readFileSync(path.join(dir, file), "utf-8");
+        const idMatch = content.match(/^id:\s*"?([A-Z]+-\d+)"?\s*$/m);
         const nameMatch = content.match(/^name:\s*"?(.+?)"?\s*$/m);
-        if (nameMatch) names[m[1]!] = nameMatch[1]!;
+        if (idMatch && nameMatch) names[idMatch[1]!] = nameMatch[1]!;
       } catch { /* skip unreadable files */ }
     }
     json(res, names);
@@ -410,7 +441,7 @@ export function handleApiRequest(url: string, res: ServerResponse): void {
   const specMatch = url.match(/^\/api\/test-spec\/([^/]+)$/);
   if (specMatch) {
     const testId = decodeURIComponent(specMatch[1]!);
-    const found = findSpecByPrefix("user-tasks", testId);
+    const found = findTestDefinitionByPrefix(testId);
     if (!found) { json(res, { error: `No spec found for ${testId}` }, 404); return; }
     const content = fs.readFileSync(path.join(found.dir, found.file), "utf-8");
     json(res, { filename: found.file, content });

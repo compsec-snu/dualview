@@ -82,8 +82,38 @@ Accepted credentials (auth is tried in this order by `run-bot.sh`):
 
 1. OpenAI Codex OAuth (`OPENAI_CODEX_ACCESS` / `OPENAI_CODEX_REFRESH`, or
    `~/.codex/auth.json`)
-2. Provider API keys: `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` / `GEMINI_API_KEY`
+2. Provider API keys: `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` / `GEMINI_API_KEY`,
+   `OPENROUTER_API_KEY`, or `FOUNDRY_ENDPOINT` + `FOUNDRY_KEY`
 3. Existing OpenClaw auth profiles under `~/.openclaw`
+
+For Qwen3.5-4B through Microsoft Foundry:
+
+```bash
+FOUNDRY_ENDPOINT=https://<resource>.services.ai.azure.com/api/projects/<project>
+FOUNDRY_KEY=...
+FOUNDRY_MODEL=qwen35-4b
+```
+
+`FOUNDRY_MODEL` is the deployment name, not just the catalog model name. The
+model must be deployed in the Foundry project before the bot can use it. With
+Foundry credentials present, the Docker setup defaults to
+`microsoft-foundry/$FOUNDRY_MODEL`.
+
+The managed endpoint enables Qwen reasoning by default and rejects the upstream
+`chat_template_kwargs.enable_thinking` override. Keep enough completion-token
+budget for reasoning.
+
+For Qwen3.5-9B through OpenRouter:
+
+```bash
+OPENROUTER_API_KEY=...
+OPENROUTER_MODEL=qwen/qwen3.5-9b
+```
+
+OpenClaw uses its native `openrouter` provider and the generated auth profile
+`openrouter:default`. When both OpenRouter and Foundry credentials are present,
+the bot setup defaults to `openrouter/$OPENROUTER_MODEL`; `--model` or
+`DUALVIEW_BOT_MODEL` still takes precedence.
 
 ---
 

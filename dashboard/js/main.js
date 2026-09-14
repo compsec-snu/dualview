@@ -661,6 +661,7 @@ async function selectSession(session) {
   S.currentSession = session;
   S.logEntries = null;
   S.logData = {};
+  S.concurrencyData = {};
   S.conversationData = {};
   S.auditData = {};
   S.notifyData = {};
@@ -1039,7 +1040,7 @@ document.addEventListener('click', async (e) => {
     return;
   }
 
-  // Test item click -> navigate to that test's workspace conversation
+  // Test item click -> navigate to that test's workspace without changing tabs
   const testItem = e.target.closest('.session-test-item');
   if (testItem) {
     if (testItem.dataset.wsid) {
@@ -1054,11 +1055,12 @@ document.addEventListener('click', async (e) => {
       S.auditWsFilter = S.currentWsId;
       S.symbolTableWsFilter = S.currentWsId;
       S.gitWsFilter = S.currentWsId;
-      S.currentTab = 'conversation';
+      const selectedTestName = wsTestNameMap()[S.currentWsId];
+      S.currentSpecTestId = selectedTestName ? testIdFromName(selectedTestName) : null;
       updateSessionHeader();
       updateUrlState();
       renderSidebar();
-      await showTab('conversation');
+      await showTab(S.currentTab);
     }
     return; // consume click even if no wsid (don't let it fall through)
   }

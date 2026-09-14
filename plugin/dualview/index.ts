@@ -1,7 +1,7 @@
 import { randomBytes } from "crypto";
 import { appendFileSync, mkdirSync, existsSync, readFileSync, writeFileSync } from "fs";
 import { homedir, tmpdir } from "os";
-import { join, dirname, resolve as resolvePath } from "path";
+import { isAbsolute, join, dirname, relative, resolve as resolvePath, sep } from "path";
 import https from "https";
 import { TOOL_INBOUND_SPEC, getToolInboundSpec } from "./policy/tool-inbound.js";
 import type { ToolSpec, SchemaNode, FieldMarker } from "./policy/schema-types.js";
@@ -41,8 +41,13 @@ import {
   findContainingRoot,
   verifyNonNested as verifyOnDemandNonNested,
 } from "./dualview-ondemand.js";
+import { canonicalWorkspacePath } from "./dualview-paths.js";
 import { createOnDemandFileCommitHandler } from "./dualview-filecommit-ondemand.js";
-import { buildRestrictedExecCommand, type RestrictedExecMount } from "./dualview-restricted-exec.js";
+import {
+  buildPlatformRestrictedExecCommand,
+  rewritePlatformRestrictedExecWorkdir,
+  type RestrictedExecMount,
+} from "./dualview-restricted-exec.js";
 import {
   createCsvQueryToolForInspect,
   createInspectSymbolTool,
@@ -113,6 +118,7 @@ interface HookContext {
 
 interface ToolResult {
   content: Array<{ type: string; text: string }> | string;
+  details?: Record<string, unknown>;
 }
 
 interface DualViewConfig {
@@ -270,6 +276,15 @@ function restoreOriginalFilePathInResult(
       block.text = block.text.split(rewrittenPath).join(originalPath);
     }
     block.text = restoreDualviewPathsInText(block.text);
+    if (typeof rewrittenPath === "string" && rewrittenPath) {
+      const canonicalRequestedPath = canonicalWorkspacePath(rewrittenPath);
+      if (
+        canonicalRequestedPath !== rewrittenPath
+        && block.text.includes(canonicalRequestedPath)
+      ) {
+        block.text = block.text.split(canonicalRequestedPath).join(rewrittenPath);
+      }
+    }
   }
 }
 
@@ -1651,6 +1666,12 @@ export default {
       if (!schema) return undefined;
 
       const isRestrictedExecResult = shouldRunWithSymbols(toolName, event.params);
+      const resultStatus = typeof event.result.details?.status === "string"
+        ? event.result.details.status
+        : undefined;
+      const resultExitCode = typeof event.result.details?.exitCode === "number"
+        ? event.result.details.exitCode
+        : undefined;
 
       // Exec inbound classification. Restricted exec (`env.RESTRICTED=1`) is
       // trusted; default exec follows the per-command schema when available.
@@ -1749,7 +1770,6 @@ export default {
 
       let labeledText: string;
       let taintAction: string;
-
       // Cases below are ordered by the *root shape* of the resolved schema.
       // See `docs/design/inbound-outbound-spec.md` → "Schema model" for the
       // FieldMarker / object / __items hierarchy.
@@ -1893,6 +1913,8 @@ export default {
             origin,
             ...(execInboundId ? { execInboundId } : {}),
             ...(symbolsCreated ? { symbolsCreated } : {}),
+            ...(resultStatus ? { status: resultStatus } : {}),
+            ...(resultExitCode !== undefined ? { exitCode: resultExitCode } : {}),
           },
         }, log);
       }
@@ -2217,18 +2239,51 @@ export default {
         loadOnDemandRegistry();
         cleanupOnDemandOrphans();
         const configuredFileToolBasePath = cfg.fileTrackingGitRoot
-          ? (cfg.fileTrackingGitRoot.startsWith("~/")
-              ? join(homedir(), cfg.fileTrackingGitRoot.slice(2))
-              : resolvePath(cfg.fileTrackingGitRoot))
+          ? canonicalWorkspacePath(
+              cfg.fileTrackingGitRoot.startsWith("~/")
+                ? join(homedir(), cfg.fileTrackingGitRoot.slice(2))
+                : resolvePath(cfg.fileTrackingGitRoot),
+            )
           : undefined;
-        if (cfg.fileTrackingGitRoot) {
-          const root = resolveOnDemandTrackingRoot(
+        const configuredTrackingRoot = cfg.fileTrackingGitRoot
+          ? resolveOnDemandTrackingRoot(
             join(configuredFileToolBasePath!, ".dualview-policy-seed"),
             { allowTemporary: true },
-          );
-          if (root && VERBOSE) {
-            log.info(`[DualView-ondemand] configured tracking root active: ${root.workTree}`);
+          )
+          : null;
+        const pathWithinScope = (pathPrefix: string, filePath: string) => {
+          const normalizedPath = filePath.replaceAll("\\", "/").replace(/^\.\/+/, "").replace(/\/+$/, "");
+          const normalizedPrefix = pathPrefix.replaceAll("\\", "/").replace(/^\.\/+/, "").replace(/\/+$/, "");
+          return normalizedPrefix.length === 0
+            || normalizedPath === normalizedPrefix
+            || normalizedPath.startsWith(normalizedPrefix + "/");
+        };
+        const activeOnDemandScopes = () => {
+          if (!configuredFileToolBasePath) {
+            return [...getTrackedRoots().values()].map((root) => ({ root, pathPrefix: "" }));
           }
+          const root = findContainingRoot(configuredFileToolBasePath);
+          if (!root) return [];
+          const pathPrefix = relative(root.workTree, configuredFileToolBasePath);
+          if (pathPrefix === ".." || pathPrefix.startsWith(".." + sep) || isAbsolute(pathPrefix)) {
+            return [];
+          }
+          return [{ root, pathPrefix }];
+        };
+        const activeOnDemandRoots = () => {
+          return activeOnDemandScopes().map((scope) => scope.root);
+        };
+        const isActiveOnDemandPath = (root: { workTree: string }, filePath: string) => {
+          return activeOnDemandScopes().some((scope) => (
+            scope.root.workTree === root.workTree
+            && pathWithinScope(scope.pathPrefix, filePath)
+          ));
+        };
+        if (configuredTrackingRoot && VERBOSE) {
+          log.info(`[DualView-ondemand] configured tracking root active: ${configuredTrackingRoot.workTree}`);
+        }
+        if (cfg.fileTrackingGitRoot && !configuredTrackingRoot) {
+          log.warn(`[DualView-ondemand] configured tracking root unavailable: ${configuredFileToolBasePath}`);
         }
         if (explicitUntrustedDirPolicyPaths.length > 0) {
           try {
@@ -2243,7 +2298,7 @@ export default {
             throw new Error(`[DualView] On-demand policy-dir sync failed: ${(err as Error).message}`);
           }
         }
-        log.info(`[DualView] File tracking enabled (strategy=ondemand, mode=worktree) — ${getTrackedRoots().size} existing root(s) loaded`);
+        log.info(`[DualView] File tracking enabled (strategy=ondemand, mode=worktree) — ${[...activeOnDemandRoots()].length} active root(s)`);
 
         // Human-edit reconciliation: detect uncommitted human edits across
         // active on-demand roots before the agent's tool call proceeds. Must
@@ -2252,13 +2307,18 @@ export default {
         if (humanEditPolicy !== "ignore") {
           api.on("before_tool_call", (_event, ctx) => {
             if (isDisabledSession(ctx.sessionKey)) return {};
-            for (const root of getTrackedRoots().values()) {
+            for (const { root, pathPrefix } of activeOnDemandScopes()) {
               try {
                 const result = reconcileHumanEdits({
                   trackedRoot: root,
                   dbPath: cfg.symbolDbPath,
                   log,
                   auditWrite: fileTrackingAudit,
+                  symbolMap: globalSymbols,
+                  isPolicyUntrusted: explicitUntrustedDirPolicyPaths.length > 0
+                    ? (absolutePath) => policyEngine.get("DIR")?.classify(absolutePath) === "UNTRUSTED"
+                    : undefined,
+                  pathFilter: (filePath) => pathWithinScope(pathPrefix, filePath),
                 });
                 if (result && VERBOSE) {
                   log.info(`[DualView-human-edit-od] Reconciled ${result.files.length} file(s), promoted ${result.promotedSymbols.length} symbol(s) in ${root.workTree}`);
@@ -2280,25 +2340,19 @@ export default {
             const filePath = filePathKey ? event.params[filePathKey] as string : undefined;
             if (!filePath || !filePathKey) return {};
             const fileToolBasePath = inferOnDemandRelativeBase(configuredFileToolBasePath);
-
-            if (toolName === "read" && explicitUntrustedDirPolicyPaths.length > 0) {
-              const dirCategory = policyEngine.get("DIR");
-              let classifiedPath = filePath;
-              if (!classifiedPath.startsWith("/") && !classifiedPath.startsWith("~/")) {
-                classifiedPath = resolvePath(fileToolBasePath, classifiedPath);
-              }
-              if (dirCategory?.classify(classifiedPath) === "UNTRUSTED") {
-                try {
-                  syncPolicyDirPathsToOnDemand({
-                    policyPaths: explicitUntrustedDirPolicyPaths,
-                    basePath: policyBasePath,
-                    dbPath: cfg.symbolDbPath,
-                    log,
-                    symbolMap: globalSymbols,
-                  });
-                } catch (err) {
-                  log.warn(`[DualView-ondemand] Lazy policy-dir sync failed: ${(err as Error).message}`);
+            if (configuredFileToolBasePath) {
+              const resolvedFilePath = filePath.startsWith("~/")
+                ? join(homedir(), filePath.slice(2))
+                : resolvePath(fileToolBasePath, filePath);
+              const canonicalFilePath = canonicalWorkspacePath(resolvedFilePath);
+              if (
+                canonicalFilePath !== configuredFileToolBasePath
+                && !canonicalFilePath.startsWith(configuredFileToolBasePath + sep)
+              ) {
+                if (VERBOSE) {
+                  log.warn(`[DualView-ondemand] file path outside configured tracking root: ${filePath}`);
                 }
+                return {};
               }
             }
 
@@ -2313,7 +2367,13 @@ export default {
                 if (!existsSync(parentDir)) mkdirSync(parentDir, { recursive: true });
               }
               if (VERBOSE) log.info(`[DualView-ondemand] Rewriting ${toolName} path (key=${filePathKey}): ${filePath} → ${result.rewritten}`);
-              return { params: { ...event.params, [filePathKey]: result.rewritten } };
+              return {
+                params: {
+                  ...event.params,
+                  [filePathKey]: result.rewritten,
+                  _dualview_original_path: filePath,
+                },
+              };
             }
           }
 
@@ -2336,10 +2396,16 @@ export default {
               command: event.params.command,
               workdir,
               trustedPathFor: (absScriptPath) => {
-                const root = findContainingRoot(absScriptPath);
-                if (!root) return null;
-                if (absScriptPath !== root.workTree && !absScriptPath.startsWith(root.workTree + "/")) return null;
-                return root.trustedPath + absScriptPath.slice(root.workTree.length);
+                const canonicalScriptPath = canonicalWorkspacePath(absScriptPath);
+                const scope = activeOnDemandScopes().find(({ root, pathPrefix }) => (
+                  (canonicalScriptPath === root.workTree || canonicalScriptPath.startsWith(root.workTree + sep))
+                  && pathWithinScope(
+                    pathPrefix,
+                    relative(root.workTree, canonicalScriptPath),
+                  )
+                ));
+                if (!scope) return null;
+                return scope.root.trustedPath + canonicalScriptPath.slice(scope.root.workTree.length);
               },
               log,
             });
@@ -2359,8 +2425,8 @@ export default {
           const cmd = event.params?.command as string | undefined;
           if (!cmd) return {};
 
-          const roots = [...getTrackedRoots().values()];
-          if (roots.length === 0) return {};
+          const scopes = activeOnDemandScopes();
+          if (scopes.length === 0) return {};
 
           try {
             verifyOnDemandNonNested();
@@ -2368,19 +2434,34 @@ export default {
             log.warn(`[DualView-ondemand] Restricted exec saw nested tracked roots; mount order will follow path depth: ${(err as Error).message}`);
           }
 
-          const mounts: RestrictedExecMount[] = roots.map((root) => ({
-            trustedPath: root.trustedPath,
-            workTree: root.workTree,
-          }));
-          const wrappedCmd = buildRestrictedExecCommand(cmd, mounts);
+          const mounts: RestrictedExecMount[] = scopes.map(({ root, pathPrefix }) => {
+            const trustedPath = pathPrefix ? join(root.trustedPath, pathPrefix) : root.trustedPath;
+            const workTree = pathPrefix ? configuredFileToolBasePath! : root.workTree;
+            if (!existsSync(trustedPath)) mkdirSync(trustedPath, { recursive: true });
+            return { trustedPath, workTree };
+          });
+          const wrappedCmd = buildPlatformRestrictedExecCommand(cmd, mounts);
+          const wrappedWorkdir = rewritePlatformRestrictedExecWorkdir(
+            event.params?.workdir as string | undefined,
+            mounts,
+          );
           if (VERBOSE) log.info(`[DualView-ondemand] Wrapping restricted exec with ${mounts.length} active tracked root mount(s)`);
-          return { params: { ...event.params, command: wrappedCmd } };
+          return {
+            params: {
+              ...event.params,
+              command: wrappedCmd,
+              ...(wrappedWorkdir ? { workdir: wrappedWorkdir } : {}),
+            },
+          };
         }, { priority: 150 });
 
         // On-demand commit handler (dual-branch write path per tracked root)
         const odCommitHandler = createOnDemandFileCommitHandler({
           dbPath: cfg.symbolDbPath,
+          symbolMap: globalSymbols,
           log,
+          roots: activeOnDemandRoots,
+          pathFilter: isActiveOnDemandPath,
           auditWrite: fileTrackingAudit,
         });
         api.on("after_tool_call", (event, ctx) => {
@@ -2452,6 +2533,10 @@ export default {
                 dbPath: cfg.symbolDbPath,
                 log,
                 auditWrite: fileTrackingAudit,
+                symbolMap: globalSymbols,
+                isPolicyUntrusted: explicitUntrustedDirPolicyPaths.length > 0
+                  ? (absolutePath) => policyEngine.get("DIR")?.classify(absolutePath) === "UNTRUSTED"
+                  : undefined,
               });
               if (result && VERBOSE) {
                 log.info(`[DualView-human-edit] Reconciled ${result.files.length} file(s), promoted ${result.promotedSymbols.length} symbol(s)`);
@@ -2475,24 +2560,6 @@ export default {
             }
             const dirCategory = policyEngine.get("DIR");
             if (filePath && filePathKey && dirCategory?.classify(filePath) === "UNTRUSTED") {
-              // Lazy sync: a file under a policy-untrusted dir may have appeared
-              // (or been overwritten with raw content) after the startup sync.
-              // Re-run the sync so the trusted view gets a fresh policy_file
-              // symbol; idempotent for already-symbolized files.
-              if (explicitUntrustedDirPolicyPaths.length > 0) {
-                try {
-                  syncPolicyDirPathsToWorktree({
-                    gitRoot,
-                    policyPaths: explicitUntrustedDirPolicyPaths,
-                    basePath: policyBasePath,
-                    dbPath: cfg.symbolDbPath,
-                    log,
-                    symbolMap: globalSymbols,
-                  });
-                } catch (err) {
-                  log.warn(`[DualView-worktree] Lazy policy-dir sync failed: ${(err as Error).message}`);
-                }
-              }
               const rewritten = rewriteToWorktree(gitRoot, filePath);
               if (rewritten && existsSync(rewritten) && rewritten !== filePath) {
                 if (VERBOSE) log.info(`[DualView-worktree] Rewriting policy-untrusted read path (key=${filePathKey}): ${filePath} → ${rewritten}`);
@@ -2543,12 +2610,23 @@ export default {
             // parent (gateway) and human view are unaffected.
             const cmd = event.params?.command as string | undefined;
             if (cmd) {
-              const wrappedCmd = buildRestrictedExecCommand(cmd, [{
+              const mounts: RestrictedExecMount[] = [{
                 trustedPath,
                 workTree: gitRoot,
-              }]);
-              if (VERBOSE) log.info(`[DualView-worktree] Wrapping restricted exec in mount namespace`);
-              return { params: { ...event.params, command: wrappedCmd } };
+              }];
+              const wrappedCmd = buildPlatformRestrictedExecCommand(cmd, mounts);
+              const wrappedWorkdir = rewritePlatformRestrictedExecWorkdir(
+                event.params?.workdir as string | undefined,
+                mounts,
+              );
+              if (VERBOSE) log.info(`[DualView-worktree] Wrapping restricted exec for Agent filesystem isolation`);
+              return {
+                params: {
+                  ...event.params,
+                  command: wrappedCmd,
+                  ...(wrappedWorkdir ? { workdir: wrappedWorkdir } : {}),
+                },
+              };
             }
           }
 

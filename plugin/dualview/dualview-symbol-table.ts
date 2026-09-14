@@ -35,6 +35,40 @@ export interface SymbolMap {
   symbols: Map<string, SymbolEntry>;
 }
 
+export interface SymbolMutationJournal {
+  inserted: Map<string, SymbolEntry>;
+  updated: Map<string, { before: SymbolEntry; after: SymbolEntry }>;
+}
+
+export function createSymbolMutationJournal(): SymbolMutationJournal {
+  return {
+    inserted: new Map(),
+    updated: new Map(),
+  };
+}
+
+function cloneSymbolEntry(entry: SymbolEntry): SymbolEntry {
+  return { ...entry };
+}
+
+function recordSymbolUpdate(
+  journal: SymbolMutationJournal | undefined,
+  symName: string,
+  before: SymbolEntry,
+  after: SymbolEntry,
+): void {
+  if (!journal) return;
+  if (journal.inserted.has(symName)) {
+    journal.inserted.set(symName, cloneSymbolEntry(after));
+    return;
+  }
+  const existing = journal.updated.get(symName);
+  journal.updated.set(symName, {
+    before: existing?.before ?? cloneSymbolEntry(before),
+    after: cloneSymbolEntry(after),
+  });
+}
+
 /** Regex to detect symbol references in text. Delegates to active format. */
 export function getSymbolPattern(): RegExp {
   return getActiveFormat().pattern;
@@ -197,6 +231,61 @@ export function saveSymbolMap(symbolMap: SymbolMap, dbPath?: string): void {
     });
 
     saveAll();
+  } finally {
+    db.close();
+  }
+}
+
+export function rollbackSymbolMapChanges(
+  journal: SymbolMutationJournal,
+  dbPath?: string,
+): void {
+  const db = openSymbolDb(dbPath);
+  try {
+    const removeInserted = db.prepare(`
+      DELETE FROM symbols
+      WHERE sym_name = ?
+        AND value = ? AND tool = ? AND field IS ? AND origin IS ?
+        AND session_key IS ? AND call_id IS ? AND created_at = ?
+        AND obsoleted_at IS ? AND obsoleted_by IS ?
+        AND derived_from IS ? AND line_range IS ?
+    `);
+    const restoreUpdated = db.prepare(`
+      UPDATE symbols
+      SET value = ?, tool = ?, field = ?, origin = ?, session_key = ?, call_id = ?,
+          created_at = ?, obsoleted_at = ?, obsoleted_by = ?, derived_from = ?, line_range = ?
+      WHERE sym_name = ?
+        AND value = ? AND tool = ? AND field IS ? AND origin IS ?
+        AND session_key IS ? AND call_id IS ? AND created_at = ?
+        AND obsoleted_at IS ? AND obsoleted_by IS ?
+        AND derived_from IS ? AND line_range IS ?
+    `);
+    const values = (entry: SymbolEntry) => [
+      entry.value,
+      entry.tool,
+      entry.field,
+      entry.origin,
+      entry.session_key,
+      entry.call_id,
+      entry.created_at,
+      entry.obsoleted_at,
+      entry.obsoleted_by,
+      entry.derived_from,
+      entry.line_range,
+    ];
+    const rollback = db.transaction(() => {
+      for (const [symName, entry] of journal.inserted) {
+        removeInserted.run(symName, ...values(entry));
+      }
+      for (const [symName, change] of journal.updated) {
+        restoreUpdated.run(
+          ...values(change.before),
+          symName,
+          ...values(change.after),
+        );
+      }
+    });
+    rollback();
   } finally {
     db.close();
   }
@@ -375,11 +464,8 @@ export function allocateSymbol(
       symbolMap.symbols.set(symName, entry);
       return symName;
     }
-    // Collision: another process owns this symName. Seed the in-memory map
-    // with a sentinel so randomHash4's prefilter avoids it next round.
-    if (!symbolMap.symbols.has(symName)) {
-      symbolMap.symbols.set(symName, entry);
-    }
+    // Another process reserved this name in SQLite. Discard the candidate
+    // and retry without exposing the losing value through the local map.
   }
   throw new Error(
     `allocateSymbol: exhausted ${ALLOC_MAX_ATTEMPTS} attempts for tool=${tool} field=${field ?? ""}`,
@@ -444,6 +530,20 @@ export function resolveAllSymbols(text: string, symbolMap: SymbolMap): string {
 // Human-edit support: symbol obsolescence and derived symbols
 // ─────────────────────────────────────────────────────────────────────────────
 
+function symbolEntriesEqual(left: SymbolEntry, right: SymbolEntry): boolean {
+  return left.value === right.value
+    && left.tool === right.tool
+    && left.field === right.field
+    && left.origin === right.origin
+    && left.session_key === right.session_key
+    && left.call_id === right.call_id
+    && left.created_at === right.created_at
+    && left.obsoleted_at === right.obsoleted_at
+    && left.obsoleted_by === right.obsoleted_by
+    && left.derived_from === right.derived_from
+    && left.line_range === right.line_range;
+}
+
 /**
  * Mark a symbol as obsoleted (e.g., by a human edit).
  * Updates both the in-memory map and the persistent DB.
@@ -453,21 +553,87 @@ export function obsoleteSymbol(
   symName: string,
   obsoletedBy: string,
   dbPath?: string,
+  journal?: SymbolMutationJournal,
 ): void {
   const entry = symbolMap.symbols.get(symName);
   if (!entry) return;
 
-  entry.obsoleted_at = Math.floor(Date.now() / 1000);
-  entry.obsoleted_by = obsoletedBy;
-
   const db = openSymbolDb(dbPath);
+  let before = cloneSymbolEntry(entry);
+  let after = {
+    ...before,
+    obsoleted_at: Math.floor(Date.now() / 1000),
+    obsoleted_by: obsoletedBy,
+  };
   try {
-    db.prepare(
-      "UPDATE symbols SET obsoleted_at = ?, obsoleted_by = ? WHERE sym_name = ?",
-    ).run(entry.obsoleted_at, obsoletedBy, symName);
+    db.exec("BEGIN IMMEDIATE");
+    try {
+      const row = db.prepare(`
+        SELECT value, tool, field, origin, session_key, call_id, created_at,
+               obsoleted_at, obsoleted_by, derived_from, line_range
+        FROM symbols WHERE sym_name = ?
+      `).get(symName) as SymbolEntry | undefined;
+      if (row) {
+        const persisted: SymbolEntry = {
+          value: row.value,
+          tool: row.tool,
+          field: row.field,
+          origin: row.origin,
+          session_key: row.session_key,
+          call_id: row.call_id,
+          created_at: row.created_at,
+          obsoleted_at: row.obsoleted_at ?? null,
+          obsoleted_by: row.obsoleted_by ?? null,
+          derived_from: row.derived_from ?? null,
+          line_range: row.line_range ?? null,
+        };
+        if (!symbolEntriesEqual(entry, persisted)) {
+          throw new Error(`symbol changed concurrently: ${symName}`);
+        }
+        before = persisted;
+        after = {
+          ...persisted,
+          obsoleted_at: Math.floor(Date.now() / 1000),
+          obsoleted_by: obsoletedBy,
+        };
+        const result = db.prepare(`
+          UPDATE symbols
+          SET obsoleted_at = ?, obsoleted_by = ?
+          WHERE sym_name = ?
+            AND value = ? AND tool = ? AND field IS ? AND origin IS ?
+            AND session_key IS ? AND call_id IS ? AND created_at = ?
+            AND obsoleted_at IS ? AND obsoleted_by IS ?
+            AND derived_from IS ? AND line_range IS ?
+        `).run(
+          after.obsoleted_at,
+          after.obsoleted_by,
+          symName,
+          persisted.value,
+          persisted.tool,
+          persisted.field,
+          persisted.origin,
+          persisted.session_key,
+          persisted.call_id,
+          persisted.created_at,
+          persisted.obsoleted_at,
+          persisted.obsoleted_by,
+          persisted.derived_from,
+          persisted.line_range,
+        );
+        if (result.changes !== 1) {
+          throw new Error(`symbol changed concurrently: ${symName}`);
+        }
+      }
+      db.exec("COMMIT");
+    } catch (err) {
+      try { db.exec("ROLLBACK"); } catch { /* transaction already closed */ }
+      throw err;
+    }
   } finally {
     db.close();
   }
+  Object.assign(entry, after);
+  recordSymbolUpdate(journal, symName, before, after);
 }
 
 export interface AllocateDerivedSymbolOpts {
@@ -505,6 +671,7 @@ export function allocateDerivedSymbol(
   symbolMap: SymbolMap,
   { parentSymName, value, lineStart, lineEnd, splitIndex }: AllocateDerivedSymbolOpts,
   dbPath?: string,
+  journal?: SymbolMutationJournal,
 ): string {
   const parent = symbolMap.symbols.get(parentSymName);
   if (!parent) {
@@ -536,7 +703,9 @@ export function allocateDerivedSymbol(
       hash: h,
       field: derivedField,
     });
-    symbolMap.symbols.set(symName, buildEntry());
+    const entry = buildEntry();
+    symbolMap.symbols.set(symName, entry);
+    journal?.inserted.set(symName, cloneSymbolEntry(entry));
     return symName;
   }
 
@@ -550,13 +719,11 @@ export function allocateDerivedSymbol(
     const entry = buildEntry();
     if (persistSymbolIfNew(symName, entry, dbPath)) {
       symbolMap.symbols.set(symName, entry);
+      journal?.inserted.set(symName, cloneSymbolEntry(entry));
       return symName;
     }
-    // Collision: seed the in-memory map so randomHash4's prefilter avoids
-    // this sym_name on the next attempt.
-    if (!symbolMap.symbols.has(symName)) {
-      symbolMap.symbols.set(symName, entry);
-    }
+    // Another process reserved this name in SQLite. Discard the candidate
+    // and retry without exposing the losing value through the local map.
   }
   throw new Error(
     `allocateDerivedSymbol: exhausted ${ALLOC_MAX_ATTEMPTS} attempts for parent=${parentSymName}`,

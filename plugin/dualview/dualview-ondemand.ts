@@ -13,9 +13,9 @@
  * See docs/design/on-demand-tracking.md for the full design.
  */
 
-import { existsSync, mkdirSync, readdirSync, statSync, rmSync, readFileSync, writeFileSync } from "fs";
+import { existsSync, lstatSync, mkdirSync, readdirSync, statSync, rmSync, readFileSync, writeFileSync } from "fs";
 import { homedir } from "os";
-import { join, resolve, dirname } from "path";
+import { basename, join, resolve, dirname } from "path";
 import {
   canonicalWorkspacePath,
   dualviewAgentViewPathFor,
@@ -89,7 +89,7 @@ export {
  * Walks upward from the path checking each ancestor against the registry.
  */
 export function findContainingRoot(absPath: string): TrackedRoot | null {
-  let candidate = absPath;
+  let candidate = canonicalWorkspacePath(absPath);
   while (candidate !== "/" && candidate !== ".") {
     if (trackedRoots.has(candidate)) return trackedRoots.get(candidate)!;
     candidate = dirname(candidate);
@@ -103,7 +103,8 @@ export function findContainingRoot(absPath: string): TrackedRoot | null {
  */
 export function findChildRoots(dirPath: string): TrackedRoot[] {
   const results: TrackedRoot[] = [];
-  const prefix = dirPath.endsWith("/") ? dirPath : dirPath + "/";
+  const canonical = canonicalWorkspacePath(dirPath);
+  const prefix = canonical.endsWith("/") ? canonical : canonical + "/";
   for (const [workTree, root] of trackedRoots) {
     if (workTree.startsWith(prefix)) results.push(root);
   }
@@ -185,7 +186,7 @@ export function initTracking(workTree: string): TrackedRoot {
 
 /** Directories where tracking should never be initialized. */
 const ALWAYS_EXCLUDED_PREFIXES = ["/proc", "/sys", "/dev", "/run"];
-const TEMPORARY_EXCLUDED_PREFIXES = ["/tmp"];
+const TEMPORARY_EXCLUDED_PREFIXES = [...new Set(["/tmp", canonicalWorkspacePath("/tmp")])];
 
 export interface ResolveTrackingRootOptions {
   /**
@@ -220,6 +221,7 @@ export function resolveTrackingRoot(
     absPath = filePath.startsWith("~/")
       ? join(homedir(), filePath.slice(2))
       : resolve(filePath);
+    absPath = canonicalWorkspacePath(absPath);
   } catch {
     return null;
   }
@@ -518,6 +520,15 @@ export function inferOnDemandRelativeBase(configuredBasePath?: string): string {
   return roots.length === 1 ? roots[0]!.workTree : process.cwd();
 }
 
+function findContainingRootLexically(absPath: string): TrackedRoot | null {
+  let candidate = absPath;
+  while (candidate !== "/" && candidate !== ".") {
+    if (trackedRoots.has(candidate)) return trackedRoots.get(candidate)!;
+    candidate = dirname(candidate);
+  }
+  return trackedRoots.get("/") ?? null;
+}
+
 /**
  * Rewrite a file path to the on-demand trusted worktree.
  *
@@ -529,9 +540,9 @@ export function rewriteToOnDemandTrusted(
   createIfMissing: boolean,
   basePath?: string,
 ): { rewritten: string; root: TrackedRoot } | null {
-  let absPath: string;
+  let resolvedPath: string;
   try {
-    absPath = filePath.startsWith("~/")
+    resolvedPath = filePath.startsWith("~/")
       ? join(homedir(), filePath.slice(2))
       : filePath.startsWith("/")
         ? resolve(filePath)
@@ -540,8 +551,22 @@ export function rewriteToOnDemandTrusted(
     return null;
   }
 
+  let isSymlink = false;
+  try {
+    isSymlink = lstatSync(resolvedPath).isSymbolicLink();
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
+  }
+  const lexicalPath = join(canonicalWorkspacePath(dirname(resolvedPath)), basename(resolvedPath));
+  const lexicalRoot = findContainingRootLexically(lexicalPath);
+  const absPath = isSymlink && lexicalRoot
+    ? lexicalPath
+    : canonicalWorkspacePath(resolvedPath);
+  const existing = isSymlink && lexicalRoot
+    ? lexicalRoot
+    : findContainingRoot(absPath);
+
   // Try existing root first
-  const existing = findContainingRoot(absPath);
   if (existing) {
     if (absPath.startsWith(existing.trustedPath + "/") || absPath === existing.trustedPath) {
       return { rewritten: absPath, root: existing };

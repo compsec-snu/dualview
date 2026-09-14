@@ -31,14 +31,18 @@ function mapThinkingLevelToOpenRouterReasoningEffort(
   return thinkingLevel;
 }
 
-function normalizeProxyReasoningPayload(payload: unknown, thinkingLevel?: ThinkLevel): void {
+function normalizeProxyReasoningPayload(
+  payload: unknown,
+  thinkingLevel?: ThinkLevel,
+  injectReasoningOff = false,
+): void {
   if (!payload || typeof payload !== "object") {
     return;
   }
 
   const payloadObj = payload as Record<string, unknown>;
   delete payloadObj.reasoning_effort;
-  if (!thinkingLevel || thinkingLevel === "off") {
+  if (!thinkingLevel || (thinkingLevel === "off" && !injectReasoningOff)) {
     return;
   }
 
@@ -101,6 +105,7 @@ export function createOpenRouterSystemCacheWrapper(baseStreamFn: StreamFn | unde
 export function createOpenRouterWrapper(
   baseStreamFn: StreamFn | undefined,
   thinkingLevel?: ThinkLevel,
+  injectReasoningOff = false,
 ): StreamFn {
   const underlying = baseStreamFn ?? streamSimple;
   return (model, context, options) => {
@@ -112,7 +117,7 @@ export function createOpenRouterWrapper(
         ...options?.headers,
       },
       onPayload: (payload) => {
-        normalizeProxyReasoningPayload(payload, thinkingLevel);
+        normalizeProxyReasoningPayload(payload, thinkingLevel, injectReasoningOff);
         return onPayload?.(payload, model);
       },
     });

@@ -13,6 +13,8 @@ for this release, and the local dashboard.
 
 ```
 plugin/dualview/   DualView OpenClaw plugin
+plugin/claude-code/ Claude Code DualView plugin adapter
+plugin/langchain/  LangChain JS DualView middleware prototype
 openclaw/          bundled OpenClaw source for this release
 dashboard/         local DualView activity/session dashboard
 ```
@@ -66,6 +68,14 @@ is `openai-codex/gpt-5.3-codex-spark`; override it with `--model` or
 `DUALVIEW_BOT_MODEL`.
 The `inspect_symbol` U-LLM fallback/logging model follows the same model unless
 `DUALVIEW_BOT_INSPECT_MODEL` is set.
+
+For Qwen3.5-4B on Microsoft Foundry, set `FOUNDRY_ENDPOINT`, `FOUNDRY_KEY`, and
+optionally `FOUNDRY_MODEL` in `.env`. When Foundry credentials are present, the
+setup script selects that Qwen deployment automatically.
+
+For Qwen3.5-9B on OpenRouter, set `OPENROUTER_API_KEY` and optionally
+`OPENROUTER_MODEL` (default: `qwen/qwen3.5-9b`). The setup script selects
+`openrouter/$OPENROUTER_MODEL` automatically.
 
 Use the setup script for normal starts and restarts:
 

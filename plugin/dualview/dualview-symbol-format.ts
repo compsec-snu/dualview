@@ -78,6 +78,10 @@ function sym(fmt: SymbolFormat, tool: string, hash: string, field?: string): str
 export interface SymbolSystemPromptOptions {
   /** Compatibility option for exec fallback behavior. */
   execInboundDefault?: "TRUSTED" | "UNTRUSTED";
+  /** Whether the runtime implements OpenClaw's RESTRICTED=1 exec sandbox. */
+  restrictedExec?: boolean;
+  /** Actual shell tool name when a framework renames OpenClaw's exec tool. */
+  restrictedExecToolName?: string;
 }
 
 /**
@@ -87,10 +91,12 @@ export interface SymbolSystemPromptOptions {
  */
 export function buildSymbolSystemPrompt(
   fmt: SymbolFormat,
-  _options: SymbolSystemPromptOptions = {},
+  options: SymbolSystemPromptOptions = {},
 ): string {
   const g = (tool: string, hash: string, field?: string) => fmt.generate({ tool, hash, field });
-  const execSection = buildExecSectionFull(fmt);
+  const execSection = options.restrictedExec === false
+    ? buildExecSectionDefaultOnly(fmt)
+    : buildExecSectionFull(fmt, options.restrictedExecToolName ?? "exec");
 
   return `
 ## DualView Symbols
@@ -124,8 +130,11 @@ forwarded onward as a symbol.
    result** (e.g., a summary, specific fields, a reformatted output). If the
    user simply asked for the data itself, output the symbol directly —
    resolution happens automatically.
-5. When calling \`inspect_symbol\`, you **must** provide the \`prompt\` parameter
-   describing what you need (e.g., "summarize this content", "extract the title").
+5. When calling \`inspect_symbol\`, you **must** provide all three required
+   parameters: \`symbols\`, \`outputSchema\`, and \`prompt\`. Define every
+   requested output field in \`outputSchema\` (e.g.,
+   \`{ "summary": "string" }\`) and describe the transformation in \`prompt\`
+   (e.g., "summarize this content", "extract the title").
 6. If the user asks you to create a file or artifact from symbolized source
    data, ask \`inspect_symbol\` to produce the **complete final artifact
    content**, then write the returned symbol token directly to the requested
@@ -191,13 +200,23 @@ ${execSection}
 `.trim();
 }
 
+function buildExecSectionDefaultOnly(fmt: SymbolFormat): string {
+  return `### Exec Data Flow
+
+- Symbols in exec inputs are resolved to raw values before execution.
+- Exec output is untrusted and returns as a symbol such as ${sym(fmt, "exec", "a1b2")}.
+- Use \`inspect_symbol\` to derive structured information from symbolized output.
+- This LangChain prototype does not provide the OpenClaw \`RESTRICTED=1\` sandbox mode.`;
+}
+
 /**
  * Exec guidance for the default and RESTRICTED=1 modes.
  */
-function buildExecSectionFull(fmt: SymbolFormat): string {
+function buildExecSectionFull(fmt: SymbolFormat, toolName: string): string {
   return `### Exec Modes
 
-The \`exec\` tool has two modes. Choose based on whether the command is local-only or needs network/raw data.
+The shell tool is named \`${toolName}\`. It has two modes. Choose based on
+whether the command is local-only or needs network/raw data.
 
 #### Default exec
 - Symbols in your command are **resolved to raw values** before execution.
@@ -210,7 +229,7 @@ The \`exec\` tool has two modes. Choose based on whether the command is local-on
 
 #### Restricted exec (\`RESTRICTED=1\`)
 Use this for local-only commands that don't need network or raw data values.
-- Set \`env: { "RESTRICTED": "1" }\` in the exec tool call.
+- Set \`env: { "RESTRICTED": "1" }\` in the \`${toolName}\` tool call.
 - The command runs in a **sandbox**: no network, symbolized filesystem.
 - Symbols in the command are **kept as-is** (not resolved).
 - Output is **trusted** if the command only reads local state. You can read it directly.

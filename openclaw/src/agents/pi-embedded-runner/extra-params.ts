@@ -408,7 +408,13 @@ export function applyExtraParamsToAgent(
     // See: openclaw/openclaw#32039
     const skipReasoningInjection = modelId === "auto" || isProxyReasoningUnsupported(modelId);
     const openRouterThinkingLevel = skipReasoningInjection ? undefined : thinkingLevel;
-    agent.streamFn = createOpenRouterWrapper(agent.streamFn, openRouterThinkingLevel);
+    const injectReasoningOff =
+      thinkingLevel === "off" && modelId.toLowerCase().startsWith("qwen/qwen3.5-");
+    agent.streamFn = createOpenRouterWrapper(
+      agent.streamFn,
+      openRouterThinkingLevel,
+      injectReasoningOff,
+    );
     agent.streamFn = createOpenRouterSystemCacheWrapper(agent.streamFn);
   }
 

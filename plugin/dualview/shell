@@ -6,4 +6,8 @@ fi
 
 export DUALVIEW_SHELL=1
 
+if [ "$(uname -s)" = "Darwin" ]; then
+    exec "$ORIGINAL_SHELL" "$@"
+fi
+
 exec unshare -nc -- "$ORIGINAL_SHELL" "$@"
